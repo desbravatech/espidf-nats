@@ -38,7 +38,7 @@ An ESP-IDF and FreeRTOS compatible C++ library for communicating with a [NATS](h
 **Via ESP-IDF Component Registry (recommended):**
 
 ```bash
-idf.py add-dependency "debsahu/espidf-nats^1.1.0"
+idf.py add-dependency "debsahu/espidf-nats^1.2.0"
 ```
 
 **Or clone the repository as an ESP-IDF component:**
@@ -178,6 +178,26 @@ NATS nats("nats.example.com", 4222, "user", "pass", &tls_config);
 - **client_key_len**: Length of private key buffer
 - **skip_cert_verification**: Skip certificate validation (insecure, for development only)
 - **server_name**: Server name for SNI and certificate validation
+- **crt_bundle_attach**: ESP-IDF certificate bundle attach function (see below)
+
+### Using ESP-IDF Certificate Bundle (Recommended for Public CAs)
+
+Instead of embedding individual CA certificates, you can use ESP-IDF's built-in certificate bundle which includes Mozilla's trusted CA list. This is ideal when connecting to servers with certificates from public CAs (e.g., Let's Encrypt, DigiCert, Cloudflare).
+
+```cpp
+#include <esp_crt_bundle.h>
+
+nats_tls_config_t tls_config = {
+    .enabled = true,
+    .ca_cert = NULL,
+    .ca_cert_len = 0,
+    .skip_cert_verification = false,
+    .server_name = "nats.example.com",
+    .crt_bundle_attach = esp_crt_bundle_attach  // Use system CA bundle
+};
+```
+
+Make sure your `sdkconfig` has `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y` (enabled by default).
 
 ### Embedding Certificates
 

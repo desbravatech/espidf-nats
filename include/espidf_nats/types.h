@@ -17,6 +17,8 @@ typedef struct {
     size_t client_key_len;             // Client private key length
     bool skip_cert_verification;       // Skip certificate validation (dev only)
     const char* server_name;           // SNI server name
+    void* crt_bundle_attach;           // Certificate bundle attach function (esp_crt_bundle_attach)
+                                       // When set, uses ESP-IDF's built-in CA bundle instead of ca_cert
 } nats_tls_config_t;
 
 /**

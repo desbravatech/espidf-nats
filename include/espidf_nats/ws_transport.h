@@ -155,8 +155,15 @@ public:
 
         // TLS configuration
         if (tls_config.enabled) {
-            ws_cfg.cert_pem = tls_config.ca_cert;
-            ws_cfg.cert_len = tls_config.ca_cert_len;
+            // Use certificate bundle if provided (preferred for public CAs)
+            if (tls_config.crt_bundle_attach != NULL) {
+                ws_cfg.crt_bundle_attach = (esp_err_t (*)(void *))tls_config.crt_bundle_attach;
+                ESP_LOGI(TAG, "Using ESP-IDF certificate bundle for TLS");
+            } else if (tls_config.ca_cert != NULL && tls_config.ca_cert_len > 0) {
+                // Fall back to explicit CA cert
+                ws_cfg.cert_pem = tls_config.ca_cert;
+                ws_cfg.cert_len = tls_config.ca_cert_len;
+            }
             ws_cfg.client_cert = tls_config.client_cert;
             ws_cfg.client_cert_len = tls_config.client_cert_len;
             ws_cfg.client_key = tls_config.client_key;

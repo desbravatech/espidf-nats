@@ -26,6 +26,9 @@
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/error.h>
 #include <mbedtls/net_sockets.h>
+#ifdef CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
+#include <esp_crt_bundle.h>
+#endif
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
@@ -533,8 +536,17 @@ public:
             return false;
         }
 
-        // Parse CA certificate
-        if (tls_config.ca_cert != NULL && tls_config.ca_cert_len > 0) {
+        // Parse CA certificate or use certificate bundle
+        bool ca_configured = false;
+#ifdef CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
+        if (tls_config.crt_bundle_attach != NULL) {
+            // Use ESP-IDF certificate bundle
+            esp_crt_bundle_attach(mbedtls_conf);
+            ca_configured = true;
+            ESP_LOGI(TAG, "Using ESP-IDF certificate bundle for TLS");
+        }
+#endif
+        if (!ca_configured && tls_config.ca_cert != NULL && tls_config.ca_cert_len > 0) {
             ret = mbedtls_x509_crt_parse(mbedtls_cacert,
                                          (const unsigned char*)tls_config.ca_cert,
                                          tls_config.ca_cert_len);
@@ -545,6 +557,7 @@ public:
                 last_error = NATS_ERR_TLS_INIT_FAILED;
                 return false;
             }
+            ca_configured = true;
         }
 
         // Set up SSL config
@@ -561,8 +574,11 @@ public:
         }
 
         // Configure certificate verification
-        if (tls_config.ca_cert != NULL) {
-            mbedtls_ssl_conf_ca_chain(mbedtls_conf, mbedtls_cacert, NULL);
+        if (ca_configured) {
+            // Only set CA chain if we're not using the bundle (bundle attaches its own)
+            if (tls_config.crt_bundle_attach == NULL && tls_config.ca_cert != NULL) {
+                mbedtls_ssl_conf_ca_chain(mbedtls_conf, mbedtls_cacert, NULL);
+            }
             if (tls_config.skip_cert_verification) {
                 mbedtls_ssl_conf_authmode(mbedtls_conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
             } else {
