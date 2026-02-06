@@ -609,10 +609,12 @@ class NATS {
                 return true;  // No validation needed if TLS is disabled
             }
 
-            // If TLS is enabled and certificate verification is not skipped, CA cert must be provided
+            // If TLS is enabled and certificate verification is not skipped, a CA source must be provided
             if (!tls_config.skip_cert_verification) {
-                if (tls_config.ca_cert == NULL || tls_config.ca_cert_len == 0) {
-                    ESP_LOGE(tag, "TLS enabled with cert verification but no CA certificate provided");
+                bool has_ca_cert = (tls_config.ca_cert != NULL && tls_config.ca_cert_len > 0);
+                bool has_crt_bundle = (tls_config.crt_bundle_attach != NULL);
+                if (!has_ca_cert && !has_crt_bundle) {
+                    ESP_LOGE(tag, "TLS enabled with cert verification but no CA certificate or bundle provided");
                     last_error_code = NATS_ERR_INVALID_CONFIG;
                     return false;
                 }
