@@ -45,6 +45,9 @@
 typedef void (*event_cb)();
 typedef void (*connect_cb)(bool success);
 
+// Logging tag alias for backward compatibility within this file
+namespace { const char* tag = NATSUtil::log_tag; }
+
 class NATS {
 
     public:
@@ -91,6 +94,7 @@ class NATS {
 
         ConnectState connect_state;
         connect_cb async_connect_cb;
+        int log_tick_count;
 
         nats_connection_metrics_t metrics;
         nats_error_code_t last_error_code;
@@ -154,6 +158,7 @@ class NATS {
             last_reconnect_attempt(0),
             connect_state(DISCONNECTED),
             async_connect_cb(NULL),
+            log_tick_count(0),
             connected(false),
             max_outstanding_pings(3),
             max_reconnect_attempts(-1),
@@ -250,6 +255,7 @@ class NATS {
             last_reconnect_attempt(0),
             connect_state(DISCONNECTED),
             async_connect_cb(NULL),
+            log_tick_count(0),
             connected(false),
             max_outstanding_pings(3),
             max_reconnect_attempts(-1),
@@ -2315,7 +2321,10 @@ class NATS {
                 return;
             }
             if (!connected) {
-                // Can't buffer binary data easily, just skip
+                // Binary messages cannot be buffered (pending_msg_t is string-based)
+                // Set error code so caller knows the message was dropped
+                ESP_LOGW(tag, "Binary publish dropped: not connected (binary messages are not buffered)");
+                last_error_code = NATS_ERR_NOT_CONNECTED;
                 return;
             }
             // PUB protocol: PUB <subject> [reply-to] <#bytes>\r\n[payload]\r\n
@@ -2599,6 +2608,7 @@ class NATS {
             // Add subjects array
             if (config->subjects != NULL) {
                 bool first = true;
+                size_t subject_count = 0;
                 for (size_t i = 0; i < NATS_MAX_SUBJECTS && config->subjects[i] != NULL; i++) {
                     if (!first) {
                         offset += snprintf(json + offset, json_size - offset, ",");
@@ -2607,6 +2617,10 @@ class NATS {
                     offset += snprintf(json + offset, json_size - offset, "\"%s\"", config->subjects[i]);
                     if (offset >= (int)json_size) { free(json); return -1; }
                     first = false;
+                    subject_count++;
+                }
+                if (subject_count >= NATS_MAX_SUBJECTS) {
+                    ESP_LOGW(tag, "Stream subjects reached limit (%d) - array may not be NULL-terminated", NATS_MAX_SUBJECTS);
                 }
             }
             offset += snprintf(json + offset, json_size - offset, "]");
@@ -2763,13 +2777,19 @@ class NATS {
         // Pull messages from a JetStream consumer
         int jetstream_pull(const char* stream_name, const char* consumer_name, int batch_size,
                           sub_cb message_cb, timeout_cb on_timeout = NULL,
-                          unsigned long timeout_ms = 5000) {
+                          unsigned long timeout_ms = 5000, bool no_wait = true) {
             if (stream_name == NULL || consumer_name == NULL || batch_size <= 0) return -1;
             if (!connected) return -1;
 
             // Build pull request
             char json[128];
-            snprintf(json, sizeof(json), "{\"batch\":%d,\"no_wait\":true}", batch_size);
+            if (no_wait) {
+                snprintf(json, sizeof(json), "{\"batch\":%d,\"no_wait\":true}", batch_size);
+            } else {
+                // Long-poll mode: let the request expire based on timeout
+                int64_t expires_ns = (int64_t)timeout_ms * 1000000LL;
+                snprintf(json, sizeof(json), "{\"batch\":%d,\"expires\":%lld}", batch_size, expires_ns);
+            }
 
             char api_subject[256];
             snprintf(api_subject, sizeof(api_subject), "$JS.API.CONSUMER.MSG.NEXT.%s.%s",
@@ -3525,7 +3545,6 @@ class NATS {
             draining = false;
         }
 
-        int log_tick_count = 0;
         void process() {
             if (log_tick_count++ % 1000 == 0) {
                 //ESP_LOGI(tag, "(tick %d) Outstanding pings: %d, Reconnect attempts: %d", log_tick_count, outstanding_pings, reconnect_attempts);
