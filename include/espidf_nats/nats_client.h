@@ -43,6 +43,11 @@
 #include "ws_transport.h"
 #endif
 
+// Logging tag scoped to this translation unit (avoids global 'tag' collision)
+namespace {
+    constexpr const char* tag = NATSUtil::log_tag;
+}
+
 typedef void (*event_cb)();
 typedef void (*connect_cb)(bool success);
 
@@ -66,7 +71,10 @@ class NATS {
         NatsTransport* transport;
         bool owns_transport;  // true if NATS owns the transport (delete in destructor)
 
-        // Legacy members kept for backward compatibility (used when transport is NULL)
+        // Legacy TCP/TLS members (used when transport is NULL)
+        // TODO(#6): Remove legacy socket path; always use NatsTransport abstraction.
+        //           This will eliminate ~1500 lines of duplicated TCP/TLS/STARTTLS code
+        //           that already exists in tcp_transport.h
         int sockfd;
         esp_tls_t* tls;
         // mbedtls contexts for STARTTLS upgrade
@@ -721,6 +729,7 @@ class NATS {
             return success;
         }
 
+        // TODO(#6): Remove legacy socket send path - use transport->send_line()
         void send(const char* msg) {
             if (msg == NULL) return;
             size_t len = strlen(msg);
@@ -806,7 +815,7 @@ class NATS {
             metrics.bytes_sent += len + strlen(NATS_CR_LF);
         }
 
-        // Binary-safe send - sends data with explicit length (no strlen)
+        // TODO(#6): Remove legacy socket send_binary path
         void send_binary(const uint8_t* data, size_t len) {
             if (data == NULL || len == 0) return;
             ssize_t ret;
@@ -973,6 +982,7 @@ class NATS {
             }
         }
 
+        // TODO(#6): Remove legacy socket read_bytes path - use transport->read_bytes()
         /**
          * Read exactly n bytes from socket (for binary payloads like MSG/HMSG)
          * Does NOT interpret \r or \n specially - reads raw bytes
@@ -1038,6 +1048,7 @@ class NATS {
             return buf;
         }
 
+        // TODO(#6): Remove legacy socket skip_bytes path - use transport->skip_bytes()
         /**
          * Skip exactly n bytes from socket (consume trailing \r\n after payloads)
          */
@@ -1082,6 +1093,7 @@ class NATS {
             if (io_mutex != NULL) xSemaphoreGiveRecursive(io_mutex);
         }
 
+        // TODO(#6): Remove legacy socket readline path - use transport->read_line()
         char* client_readline(size_t cap = 128) {
             // Use transport if available
             if (transport != NULL && transport->is_connected()) {
@@ -1858,7 +1870,7 @@ class NATS {
         }
 
     private:
-        // Static callback functions for mbedtls bio
+        // TODO(#6): Remove - duplicated in TcpTransport
         static int mbedtls_net_send_cb(void* ctx, const unsigned char* buf, size_t len) {
             int fd = *((int*)ctx);
             int ret = ::send(fd, buf, len, 0);
@@ -1883,7 +1895,7 @@ class NATS {
             return ret;
         }
 
-        // Clean up mbedtls resources
+        // TODO(#6): Remove - duplicated in TcpTransport::cleanup_mbedtls()
         void cleanup_mbedtls() {
             if (mbedtls_ssl) {
                 mbedtls_ssl_free(mbedtls_ssl);
@@ -1913,8 +1925,8 @@ class NATS {
             using_mbedtls_directly = false;
         }
 
-        // Upgrade existing plain TCP socket to TLS (STARTTLS style)
-        // Uses mbedtls directly since esp_tls doesn't support STARTTLS
+        // TODO(#6): Remove - duplicated in TcpTransport::upgrade_to_tls()
+        //           Legacy STARTTLS path missing crt_bundle_attach support
         bool upgrade_to_tls() {
             if (!tls_config.enabled || sockfd < 0) {
                 return false;
@@ -2130,6 +2142,7 @@ class NATS {
             return false;
         }
 
+        // TODO(#6): Remove - duplicated in TcpTransport::try_connect_to_host()
         bool try_connect_to_server(const nats_server_t& server) {
             // NATS uses STARTTLS style: always connect plain TCP first,
             // then upgrade to TLS after receiving INFO with tls_required
