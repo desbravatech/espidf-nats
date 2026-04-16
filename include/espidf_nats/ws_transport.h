@@ -144,8 +144,8 @@ public:
         // Configure WebSocket client
         esp_websocket_client_config_t ws_cfg = {};
         ws_cfg.uri = uri;
-        // Note: Don't set subprotocol - NATS server may not require it
-        // ws_cfg.subprotocol = config->ws_subprotocol ? config->ws_subprotocol : NATS_WEBSOCKET_SUBPROTOCOL;
+        // Set NATS subprotocol per spec (configurable, default "nats")
+        ws_cfg.subprotocol = config->ws_subprotocol ? config->ws_subprotocol : NATS_WEBSOCKET_SUBPROTOCOL;
         ws_cfg.disable_auto_reconnect = true;  // We handle reconnection in NATS client
         ws_cfg.reconnect_timeout_ms = NATS_WEBSOCKET_RECONNECT_TIMEOUT;
         ws_cfg.buffer_size = 4096;  // Ensure buffer is large enough for NATS INFO
@@ -197,6 +197,10 @@ public:
         }
 
         // Reset connection state
+        // Drain any stale semaphore token from previous connect attempts
+        if (connect_sem != NULL) {
+            xSemaphoreTake(connect_sem, 0);  // Non-blocking drain
+        }
         ws_connected = false;
         connect_result = false;
 
@@ -245,23 +249,30 @@ public:
     }
 
     void disconnect() override {
+        // Capture client handle and clear it under mutex
+        esp_websocket_client_handle_t client_to_destroy = NULL;
+        NATSUtil::RingBuffer* buffer_to_delete = NULL;
+
         if (state_mutex != NULL) xSemaphoreTake(state_mutex, portMAX_DELAY);
 
         ws_connected = false;
-
-        if (client != NULL) {
-            esp_websocket_client_stop(client);
-            esp_websocket_client_destroy(client);
-            client = NULL;
-        }
-
-        if (rx_buffer != NULL) {
-            rx_buffer->clear();
-            delete rx_buffer;
-            rx_buffer = NULL;
-        }
+        client_to_destroy = client;
+        client = NULL;
+        buffer_to_delete = rx_buffer;
+        rx_buffer = NULL;
 
         if (state_mutex != NULL) xSemaphoreGive(state_mutex);
+
+        // Destroy outside mutex to prevent deadlock with event handler
+        if (client_to_destroy != NULL) {
+            esp_websocket_client_stop(client_to_destroy);
+            esp_websocket_client_destroy(client_to_destroy);
+        }
+
+        if (buffer_to_delete != NULL) {
+            buffer_to_delete->clear();
+            delete buffer_to_delete;
+        }
 
         state = TRANSPORT_DISCONNECTED;
     }
@@ -286,7 +297,8 @@ public:
         }
 
         // Send as text frame (NATS protocol is text-based)
-        int ret = esp_websocket_client_send_text(client, data, len, portMAX_DELAY);
+        // Use bounded timeout (10s) to prevent indefinite blocking
+        int ret = esp_websocket_client_send_text(client, data, len, pdMS_TO_TICKS(10000));
         if (ret < 0) {
             ESP_LOGE(TAG, "WebSocket send failed: %d", ret);
             last_error = NATS_ERR_WEBSOCKET_SEND_FAILED;
@@ -570,9 +582,12 @@ private:
 
     void handle_data(esp_websocket_event_data_t* data) {
         if (data == NULL || rx_buffer == NULL) return;
-
-        // Handle all data frames (op_code 1 = text, 2 = binary)
-        // NATS protocol uses text frames
+        // Only buffer text (1), binary (2), and continuation (0) frames
+        // Skip control frames (ping=9, pong=10, close=8)
+        if (data->op_code >= 8) {
+            ESP_LOGD(TAG, "Skipping control frame op_code=%d", data->op_code);
+            return;
+        }
         if (data->data_len > 0 && data->data_ptr != NULL) {
             ESP_LOGD(TAG, "WS received %d bytes", data->data_len);
             rx_buffer->write((const uint8_t*)data->data_ptr, data->data_len);
