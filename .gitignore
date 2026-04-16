@@ -43,3 +43,6 @@
 # distribution files
 *.tgz
 CLAUDE.md
+
+# Claude Code worktrees
+.claude/
