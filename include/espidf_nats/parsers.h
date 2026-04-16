@@ -1,14 +1,9 @@
 /**
  * @file parsers.h
- * @brief Typed response parsers for JetStream and Object Store
+ * @brief Typed response parsers for JetStream, KV, and Object Store
  *
  * Helper functions to parse raw NATS message payloads into typed structs.
  * Uses cJSON (included with ESP-IDF) for robust JSON parsing.
- *
- * @note Numeric fields are parsed via cJSON's double representation.
- *       Values above 2^53 (e.g., very large sequence numbers or nanosecond
- *       timestamps) may lose integer precision. This is acceptable for
- *       ESP32 use cases where such values are rare.
  */
 
 #ifndef ESPIDF_NATS_PARSERS_H
@@ -16,7 +11,6 @@
 
 #include <cJSON.h>
 #include <string.h>
-#include <stdlib.h>
 #include <esp_log.h>
 #include "types.h"
 
@@ -32,12 +26,11 @@ namespace NATSParsers {
      *
      * @param data Raw message data (JSON string)
      * @param size Size of data
-     * @param stream Output: stream name
+     * @param stream Output: stream name (pointer into parsed JSON - caller must use before freeing)
      * @param seq Output: sequence number
      * @param duplicate Output: whether this was a duplicate (deduplication)
-     * @param error_desc Output: error description if failed
+     * @param error_desc Output: error description if failed (pointer into parsed JSON)
      * @return true if ACK parsed successfully, false if error response or parse failure
-     * @note Caller must free() the returned stream and error_desc strings
      */
     inline bool parse_pub_ack(const char* data, int size,
                               const char** stream, uint64_t* seq,
@@ -62,7 +55,7 @@ namespace NATSParsers {
         if (error_obj != NULL) {
             if (error_desc != NULL) {
                 cJSON* desc = cJSON_GetObjectItemCaseSensitive(error_obj, "description");
-                *error_desc = cJSON_IsString(desc) ? strdup(desc->valuestring) : strdup("Unknown error");
+                *error_desc = cJSON_IsString(desc) ? desc->valuestring : "Unknown error";
             }
             cJSON_Delete(root);
             return false;
@@ -71,7 +64,7 @@ namespace NATSParsers {
         // Parse ACK fields
         if (stream != NULL) {
             cJSON* s = cJSON_GetObjectItemCaseSensitive(root, "stream");
-            *stream = cJSON_IsString(s) ? strdup(s->valuestring) : NULL;
+            *stream = cJSON_IsString(s) ? s->valuestring : NULL;
         }
         if (seq != NULL) {
             cJSON* s = cJSON_GetObjectItemCaseSensitive(root, "seq");
@@ -80,12 +73,6 @@ namespace NATSParsers {
         if (duplicate != NULL) {
             cJSON* d = cJSON_GetObjectItemCaseSensitive(root, "duplicate");
             *duplicate = cJSON_IsTrue(d);
-        }
-
-        // Validate required field
-        if (seq != NULL && *seq == 0 && stream != NULL && *stream == NULL) {
-            cJSON_Delete(root);
-            return false;  // Neither stream nor seq found — invalid ACK
         }
 
         cJSON_Delete(root);
@@ -160,7 +147,6 @@ namespace NATSParsers {
      * @param size Size of data
      * @param meta Output struct
      * @return true on success
-     * @note Caller must free() the string fields (name, description, digest)
      */
     inline bool parse_object_meta(const char* data, int size,
                                   object_meta_t* meta) {
@@ -178,10 +164,10 @@ namespace NATSParsers {
 
         cJSON* item;
         item = cJSON_GetObjectItemCaseSensitive(root, "name");
-        if (cJSON_IsString(item)) meta->name = strdup(item->valuestring);
+        if (cJSON_IsString(item)) meta->name = item->valuestring;
 
         item = cJSON_GetObjectItemCaseSensitive(root, "description");
-        if (cJSON_IsString(item)) meta->description = strdup(item->valuestring);
+        if (cJSON_IsString(item)) meta->description = item->valuestring;
 
         item = cJSON_GetObjectItemCaseSensitive(root, "size");
         if (cJSON_IsNumber(item)) meta->size = (size_t)item->valuedouble;
@@ -190,7 +176,7 @@ namespace NATSParsers {
         if (cJSON_IsNumber(item)) meta->chunks = (uint64_t)item->valuedouble;
 
         item = cJSON_GetObjectItemCaseSensitive(root, "digest");
-        if (cJSON_IsString(item)) meta->digest = strdup(item->valuestring);
+        if (cJSON_IsString(item)) meta->digest = item->valuestring;
 
         item = cJSON_GetObjectItemCaseSensitive(root, "mtime");
         if (cJSON_IsNumber(item)) meta->mtime = (uint64_t)item->valuedouble;
@@ -205,14 +191,11 @@ namespace NATSParsers {
      * @param data Raw message data
      * @param size Size of data
      * @param error_code Output: error code (0 if not an error)
-     * @param error_desc Output: error description string
+     * @param error_desc Output: error description string (pointer valid until next cJSON call)
      * @return true if the response IS an error
-     * @note Caller must free() the returned error_desc string
      */
     inline bool is_error_response(const char* data, int size,
                                   int* error_code, const char** error_desc) {
-        if (error_code != NULL) *error_code = 0;
-        if (error_desc != NULL) *error_desc = NULL;
         if (data == NULL || size <= 0) return false;
 
         char* json_str = (char*)malloc(size + 1);
@@ -236,7 +219,7 @@ namespace NATSParsers {
         }
         if (error_desc != NULL) {
             cJSON* desc = cJSON_GetObjectItemCaseSensitive(error_obj, "description");
-            *error_desc = cJSON_IsString(desc) ? strdup(desc->valuestring) : strdup("Unknown error");
+            *error_desc = cJSON_IsString(desc) ? desc->valuestring : "Unknown error";
         }
 
         cJSON_Delete(root);
