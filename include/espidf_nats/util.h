@@ -176,6 +176,11 @@ namespace NATSUtil {
                         return default_val;
                     }
                 }
+                if (data == NULL) {
+                    ESP_LOGE("Array", "operator[] failed: array storage is NULL");
+                    static T default_val{};
+                    return default_val;
+                }
                 // Extend len if writing beyond current size
                 if (i >= len) len = i + 1;
                 return data[i];

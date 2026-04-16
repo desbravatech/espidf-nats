@@ -2183,11 +2183,8 @@ class NATS {
         }
 
         void disconnect() {
-            // Record disconnect time so first reconnect attempt respects backoff delay
-            // (must be before the guard so it's set even when already disconnected)
-            last_reconnect_attempt = NATSUtil::millis();
-
             if (!connected && (transport == NULL || !transport->is_connected())) return;
+            last_reconnect_attempt = NATSUtil::millis();
             connected = false;
             connect_state = DISCONNECTED;
             async_connect_cb = NULL;
