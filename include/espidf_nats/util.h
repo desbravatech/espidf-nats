@@ -167,7 +167,15 @@ namespace NATSUtil {
 
             T& operator[](size_t i) {
                 // For write access, grow if needed
-                while (i >= cap) resize();
+                while (i >= cap) {
+                    size_t old_cap = cap;
+                    resize();
+                    if (cap <= old_cap || data == NULL) {
+                        ESP_LOGE("Array", "operator[] resize failed for index %zu", i);
+                        static T default_val{};
+                        return default_val;
+                    }
+                }
                 // Extend len if writing beyond current size
                 if (i >= len) len = i + 1;
                 return data[i];
@@ -181,6 +189,10 @@ namespace NATSUtil {
                         ESP_LOGE("Array", "push_back failed: resize failed at capacity %zu", cap);
                         return SIZE_MAX;  // Signal failure
                     }
+                }
+                if (data == NULL) {
+                    ESP_LOGE("Array", "push_back failed: no backing storage");
+                    return SIZE_MAX;
                 }
                 size_t i = len++;
                 data[i] = v;
