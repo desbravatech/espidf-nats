@@ -86,6 +86,8 @@ class NATS {
         size_t current_server_idx;
         const char* user;
         const char* pass;
+        nats_auth_config_t auth_config;
+        char server_nonce[256];        // Server nonce from INFO for NKey signing
 
         NATSUtil::Array<Sub*> subs;
         NATSUtil::Queue<size_t> free_sids;
@@ -200,6 +202,8 @@ class NATS {
                 } else {
                     memset(&tls_config, 0, sizeof(nats_tls_config_t));
                 }
+                memset(&auth_config, 0, sizeof(nats_auth_config_t));
+                memset(server_nonce, 0, sizeof(server_nonce));
                 memset(&metrics, 0, sizeof(nats_connection_metrics_t));
                 last_error_code = (last_error_code == NATS_ERR_INVALID_ARG) ? NATS_ERR_INVALID_ARG : NATS_ERR_NONE;
                 draining = false;
@@ -319,6 +323,8 @@ class NATS {
                 } else {
                     memset(&tls_config, 0, sizeof(nats_tls_config_t));
                 }
+                memset(&auth_config, 0, sizeof(nats_auth_config_t));
+                memset(server_nonce, 0, sizeof(server_nonce));
                 memset(&metrics, 0, sizeof(nats_connection_metrics_t));
                 last_error_code = NATS_ERR_NONE;
                 draining = false;
@@ -603,6 +609,28 @@ class NATS {
             return nats;
         }
 #endif // CONFIG_ESP_WEBSOCKET_CLIENT_ENABLE
+
+        /**
+         * Set authentication configuration
+         *
+         * @param config Authentication configuration
+         *
+         * @note For NKey auth, you must provide a sign_fn callback that performs
+         *       ed25519 signing. ESP-IDF's mbedtls may support this via
+         *       mbedtls_pk_sign() with MBEDTLS_PK_EDDSA type (ESP-IDF v5.1+).
+         *
+         * @note For .creds file auth, parse the file first with
+         *       NATSUtil::parse_creds_file() and pass the resulting config here.
+         */
+        void set_auth(const nats_auth_config_t* config) {
+            if (config != NULL) {
+                auth_config = *config;
+                // Set legacy user/pass if using that method
+                if (config->method == NATS_AUTH_USER_PASS) {
+                    // user and pass are already set via constructor
+                }
+            }
+        }
 
         /**
          * Set a custom transport (advanced usage)
@@ -928,55 +956,180 @@ class NATS {
         }
 
         void send_connect() {
-            // Build CONNECT JSON - only include user/pass if credentials are provided
+            // Build CONNECT JSON with appropriate auth fields
             // Include headers:true to enable HPUB/HMSG support
             // Include no_responders:true to get fast failure on request/reply with no subscribers
-            if (user != NULL && pass != NULL) {
-                // Escape credentials to prevent JSON injection
-                char escaped_user[NATS_MAX_CREDENTIAL_LEN * 2 + 1];
-                char escaped_pass[NATS_MAX_CREDENTIAL_LEN * 2 + 1];
-                if (json_escape(user, escaped_user, sizeof(escaped_user)) < 0) {
-                    ESP_LOGE(tag, "Failed to escape username (too long)");
-                    return;
-                }
-                if (json_escape(pass, escaped_pass, sizeof(escaped_pass)) < 0) {
-                    ESP_LOGE(tag, "Failed to escape password (too long)");
-                    return;
-                }
-                send_fmt(
-                        "CONNECT {"
-                            "\"verbose\":%s,"
-                            "\"pedantic\":%s,"
-                            "\"lang\":\"%s\","
-                            "\"version\":\"%s\","
-                            "\"protocol\":1,"
-                            "\"headers\":true,"
-                            "\"no_responders\":true,"
-                            "\"user\":\"%s\","
-                            "\"pass\":\"%s\""
-                        "}",
-                        NATS_CONF_VERBOSE? "true" : "false",
-                        NATS_CONF_PEDANTIC? "true" : "false",
-                        NATS_CLIENT_LANG,
-                        NATS_CLIENT_VERSION,
-                        escaped_user,
-                        escaped_pass);
-            } else {
-                send_fmt(
-                        "CONNECT {"
-                            "\"verbose\":%s,"
-                            "\"pedantic\":%s,"
-                            "\"lang\":\"%s\","
-                            "\"version\":\"%s\","
-                            "\"protocol\":1,"
-                            "\"headers\":true,"
-                            "\"no_responders\":true"
-                        "}",
-                        NATS_CONF_VERBOSE? "true" : "false",
-                        NATS_CONF_PEDANTIC? "true" : "false",
-                        NATS_CLIENT_LANG,
-                        NATS_CLIENT_VERSION);
+            const size_t buf_size = 2048;
+            char* buf = (char*)malloc(buf_size);
+            if (buf == NULL) {
+                ESP_LOGE(tag, "Failed to allocate CONNECT buffer");
+                last_error_code = NATS_ERR_OUT_OF_MEMORY;
+                return;
             }
+
+            int offset = snprintf(buf, buf_size,
+                "CONNECT {"
+                    "\"verbose\":%s,"
+                    "\"pedantic\":%s,"
+                    "\"lang\":\"%s\","
+                    "\"version\":\"%s\","
+                    "\"protocol\":1,"
+                    "\"headers\":true,"
+                    "\"no_responders\":true",
+                NATS_CONF_VERBOSE ? "true" : "false",
+                NATS_CONF_PEDANTIC ? "true" : "false",
+                NATS_CLIENT_LANG,
+                NATS_CLIENT_VERSION);
+            if (offset < 0 || (size_t)offset >= buf_size) {
+                ESP_LOGE(tag, "CONNECT buffer overflow");
+                NATSUtil::secure_free(buf);
+                return;
+            }
+
+            // Add authentication fields based on method
+            switch (auth_config.method) {
+                case NATS_AUTH_USER_PASS:
+                    if (user != NULL && pass != NULL) {
+                        // Escape credentials to prevent JSON injection
+                        char escaped_user[NATS_MAX_CREDENTIAL_LEN * 2 + 1];
+                        char escaped_pass[NATS_MAX_CREDENTIAL_LEN * 2 + 1];
+                        if (json_escape(user, escaped_user, sizeof(escaped_user)) < 0 ||
+                            json_escape(pass, escaped_pass, sizeof(escaped_pass)) < 0) {
+                            ESP_LOGE(tag, "Failed to escape credentials");
+                            NATSUtil::secure_free(buf);
+                            return;
+                        }
+                        int n = snprintf(buf + offset, buf_size - offset,
+                            ",\"user\":\"%s\",\"pass\":\"%s\"", escaped_user, escaped_pass);
+                        if (n < 0 || (size_t)n >= (buf_size - (size_t)offset)) {
+                            ESP_LOGE(tag, "CONNECT buffer overflow");
+                            NATSUtil::secure_free(buf);
+                            return;
+                        }
+                        offset += n;
+                    }
+                    break;
+
+                case NATS_AUTH_TOKEN:
+                    if (auth_config.token != NULL) {
+                        int n = snprintf(buf + offset, buf_size - offset,
+                            ",\"auth_token\":\"%s\"", auth_config.token);
+                        if (n < 0 || (size_t)n >= (buf_size - (size_t)offset)) {
+                            ESP_LOGE(tag, "CONNECT buffer overflow");
+                            NATSUtil::secure_free(buf);
+                            return;
+                        }
+                        offset += n;
+                    }
+                    break;
+
+                case NATS_AUTH_NKEY:
+                case NATS_AUTH_CREDENTIALS:
+                    // Validate NKey auth requirements
+                    if (auth_config.nkey_seed != NULL && auth_config.sign_fn == NULL) {
+                        ESP_LOGE(tag, "NKey auth requires sign_fn callback");
+                        last_error_code = NATS_ERR_INVALID_CONFIG;
+                        NATSUtil::secure_free(buf);
+                        return;
+                    }
+                    if (auth_config.nkey_seed != NULL && server_nonce[0] == '\0') {
+                        ESP_LOGW(tag, "NKey auth: no server nonce received, signature will be skipped");
+                    }
+                    // JWT token
+                    if (auth_config.jwt != NULL) {
+                        int n = snprintf(buf + offset, buf_size - offset,
+                            ",\"jwt\":\"%s\"", auth_config.jwt);
+                        if (n < 0 || (size_t)n >= (buf_size - (size_t)offset)) {
+                            ESP_LOGE(tag, "CONNECT buffer overflow");
+                            NATSUtil::secure_free(buf);
+                            return;
+                        }
+                        offset += n;
+                    }
+                    // NKey signature (sign server nonce with seed)
+                    if (auth_config.nkey_seed != NULL && auth_config.sign_fn != NULL && server_nonce[0] != '\0') {
+                        if (auth_config.nkey_public == NULL) {
+                            ESP_LOGE(tag, "NKey auth requires nkey_public key");
+                            last_error_code = NATS_ERR_INVALID_CONFIG;
+                            NATSUtil::secure_free(buf);
+                            return;
+                        }
+                        uint8_t signature[64];
+                        size_t sig_len = 0;
+                        if (auth_config.sign_fn(
+                                (const uint8_t*)server_nonce, strlen(server_nonce),
+                                signature, &sig_len,
+                                auth_config.nkey_seed)) {
+                            if (sig_len != 64) {
+                                ESP_LOGE(tag, "NKey signature has unexpected length: %zu (expected 64)", sig_len);
+                            } else {
+                                // Base64-encode signature for CONNECT
+                                char sig_b64[128];
+                                int b64_ret = NATSUtil::base64_encode(signature, sig_len, sig_b64, sizeof(sig_b64));
+                                if (b64_ret < 0) {
+                                    ESP_LOGE(tag, "Failed to base64-encode NKey signature");
+                                } else {
+                                    int n = snprintf(buf + offset, buf_size - offset,
+                                        ",\"sig\":\"%s\"", sig_b64);
+                                    if (n < 0 || (size_t)n >= (buf_size - (size_t)offset)) {
+                                        ESP_LOGE(tag, "CONNECT buffer overflow");
+                                        NATSUtil::secure_free(buf);
+                                        return;
+                                    }
+                                    offset += n;
+                                    // Include nkey public key
+                                    if (auth_config.nkey_public != NULL) {
+                                        int n2 = snprintf(buf + offset, buf_size - offset,
+                                            ",\"nkey\":\"%s\"", auth_config.nkey_public);
+                                        if (n2 < 0 || (size_t)n2 >= (buf_size - (size_t)offset)) {
+                                            ESP_LOGE(tag, "CONNECT buffer overflow");
+                                            NATSUtil::secure_free(buf);
+                                            return;
+                                        }
+                                        offset += n2;
+                                    }
+                                }
+                            }
+                        } else {
+                            ESP_LOGE(tag, "NKey signature failed");
+                        }
+                    }
+                    break;
+
+                case NATS_AUTH_NONE:
+                default:
+                    // Legacy fallback: use user/pass if set via constructor
+                    if (user != NULL && pass != NULL) {
+                        char escaped_user[NATS_MAX_CREDENTIAL_LEN * 2 + 1];
+                        char escaped_pass[NATS_MAX_CREDENTIAL_LEN * 2 + 1];
+                        if (json_escape(user, escaped_user, sizeof(escaped_user)) < 0 ||
+                            json_escape(pass, escaped_pass, sizeof(escaped_pass)) < 0) {
+                            ESP_LOGE(tag, "Failed to escape credentials");
+                            NATSUtil::secure_free(buf);
+                            return;
+                        }
+                        int n = snprintf(buf + offset, buf_size - offset,
+                            ",\"user\":\"%s\",\"pass\":\"%s\"", escaped_user, escaped_pass);
+                        if (n < 0 || (size_t)n >= (buf_size - (size_t)offset)) {
+                            ESP_LOGE(tag, "CONNECT buffer overflow");
+                            NATSUtil::secure_free(buf);
+                            return;
+                        }
+                        offset += n;
+                    }
+                    break;
+            }
+
+            // Close JSON
+            int close_n = snprintf(buf + offset, buf_size - offset, "}");
+            if (close_n < 0 || (size_t)close_n >= (buf_size - (size_t)offset)) {
+                ESP_LOGE(tag, "CONNECT buffer overflow at close");
+                NATSUtil::secure_free(buf);
+                return;
+            }
+
+            send(buf);
+            NATSUtil::secure_free(buf);
         }
 
         // TODO(#6): Remove legacy socket read_bytes path - use transport->read_bytes()
@@ -1203,6 +1356,17 @@ class NATS {
                         if (cJSON_IsTrue(tls_required_item)) {
                             server_tls_required = true;
                             ESP_LOGI(tag, "Server requires TLS");
+                        }
+                        // Extract server nonce for NKey authentication
+                        server_nonce[0] = '\0';  // Clear stale nonce before parsing new INFO
+                        cJSON* nonce_item = cJSON_GetObjectItemCaseSensitive(info_json, "nonce");
+                        if (cJSON_IsString(nonce_item) && nonce_item->valuestring != NULL) {
+                            size_t nonce_len = strlen(nonce_item->valuestring);
+                            if (nonce_len < sizeof(server_nonce)) {
+                                memcpy(server_nonce, nonce_item->valuestring, nonce_len);
+                                server_nonce[nonce_len] = '\0';
+                                ESP_LOGD(tag, "Server nonce: %s", server_nonce);
+                            }
                         }
                         cJSON_Delete(info_json);
                     } else {
