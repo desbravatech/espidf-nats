@@ -2314,6 +2314,12 @@ class NATS {
                 last_error_code = NATS_ERR_INVALID_ARG;
                 return;
             }
+            // Validate data pointer
+            if (data == NULL && data_len > 0) {
+                ESP_LOGE(tag, "publish_binary: data is NULL but data_len is %zu", data_len);
+                last_error_code = NATS_ERR_INVALID_ARG;
+                return;
+            }
             // Enforce server max_payload limit
             if (data_len > server_max_payload) {
                 ESP_LOGE(tag, "Binary message too large: %zu bytes (server max: %zu)", data_len, server_max_payload);
