@@ -51,9 +51,6 @@ namespace {
 typedef void (*event_cb)();
 typedef void (*connect_cb)(bool success);
 
-// Logging tag alias for backward compatibility within this file
-namespace { const char* tag = NATSUtil::log_tag; }
-
 class NATS {
 
     public:
@@ -3876,9 +3873,12 @@ class NATS {
 
                 if (ping_timer.process())
                     ping();
-            } else if (transport == NULL) {
-                // Only handle reconnection in legacy mode (no transport)
-                disconnect();
+            } else if (!connected || (transport != NULL && !transport->is_connected())) {
+                // Handle reconnection for both legacy and transport mode
+                if (connected) {
+                    // Transport dropped unexpectedly - force disconnect
+                    disconnect();
+                }
                 // Protect reconnect_attempts read with mutex
                 if (state_mutex != NULL) xSemaphoreTakeRecursive(state_mutex, portMAX_DELAY);
                 int attempts = reconnect_attempts;

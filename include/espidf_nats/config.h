@@ -74,6 +74,10 @@
 #define NATS_WEBSOCKET_RECONNECT_TIMEOUT 10000
 #endif
 
+#ifndef NATS_WEBSOCKET_SEND_TIMEOUT_MS
+#define NATS_WEBSOCKET_SEND_TIMEOUT_MS 10000
+#endif
+
 // Logging tags - namespaced to avoid global symbol collisions
 // Transport classes use their own static constexpr TAG members
 namespace NATSUtil {
