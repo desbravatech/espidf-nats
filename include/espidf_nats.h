@@ -46,5 +46,6 @@
 #include "espidf_nats/types.h"
 #include "espidf_nats/subscription.h"
 #include "espidf_nats/nats_client.h"
+#include "espidf_nats/parsers.h"
 
 #endif // ESPIDF_NATS_H
