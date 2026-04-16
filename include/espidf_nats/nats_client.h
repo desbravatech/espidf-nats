@@ -3628,7 +3628,6 @@ class NATS {
                     // Transport dropped unexpectedly - force disconnect
                     disconnect();
                 }
-                disconnect();
                 // Protect reconnect_attempts read with mutex
                 if (state_mutex != NULL) xSemaphoreTakeRecursive(state_mutex, portMAX_DELAY);
                 int attempts = reconnect_attempts;

@@ -581,16 +581,19 @@ private:
     }
 
     void handle_data(esp_websocket_event_data_t* data) {
-        if (data == NULL || rx_buffer == NULL) return;
+        if (data == NULL) return;
         // Only buffer continuation (0), text (1), and binary (2) frames
-        // Skip reserved non-control opcodes (3-7) and control frames (8+)
         if (!(data->op_code == 0 || data->op_code == 1 || data->op_code == 2)) {
-            ESP_LOGW(TAG, "Ignoring unsupported WebSocket frame op_code=%d", data->op_code);
+            ESP_LOGD(TAG, "Ignoring WebSocket frame op_code=%d", data->op_code);
             return;
         }
         if (data->data_len > 0 && data->data_ptr != NULL) {
-            ESP_LOGD(TAG, "WS received %d bytes", data->data_len);
-            rx_buffer->write((const uint8_t*)data->data_ptr, data->data_len);
+            if (state_mutex != NULL) xSemaphoreTake(state_mutex, portMAX_DELAY);
+            if (rx_buffer != NULL) {
+                ESP_LOGD(TAG, "WS received %d bytes", data->data_len);
+                rx_buffer->write((const uint8_t*)data->data_ptr, data->data_len);
+            }
+            if (state_mutex != NULL) xSemaphoreGive(state_mutex);
         }
     }
 
