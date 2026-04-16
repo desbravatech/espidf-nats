@@ -1209,6 +1209,8 @@ class NATS {
                 if (sub != NULL && !sub->is_marked_for_deletion()) {
                     // Add reference to prevent deletion during callback
                     sub->add_ref();
+                    // Clear timeout under mutex to prevent races with timeout check
+                    sub->clear_timeout();
                     // Cache whether this will max out BEFORE calling callback
                     will_max_out = (sub->max_wanted > 0 && sub->received + 1 >= sub->max_wanted);
                 } else {
@@ -1217,8 +1219,6 @@ class NATS {
                 xSemaphoreGiveRecursive(mutex);
 
                 if (sub != NULL) {
-                    // Clear timeout to prevent stale timeout callbacks
-                    sub->clear_timeout();
                     // Call user callback WITHOUT holding mutex to prevent deadlock
                     sub->call(e);
 
@@ -1301,6 +1301,8 @@ class NATS {
                 if (sub != NULL && !sub->is_marked_for_deletion()) {
                     // Add reference to prevent deletion during callback
                     sub->add_ref();
+                    // Clear timeout under mutex to prevent races with timeout check
+                    sub->clear_timeout();
                     // Cache whether this will max out BEFORE calling callback
                     will_max_out = (sub->max_wanted > 0 && sub->received + 1 >= sub->max_wanted);
                 } else {
@@ -1309,8 +1311,6 @@ class NATS {
                 xSemaphoreGiveRecursive(mutex);
 
                 if (sub != NULL) {
-                    // Clear timeout to prevent stale timeout callbacks
-                    sub->clear_timeout();
                     // Call user callback WITHOUT holding mutex to prevent deadlock
                     sub->call(e);
 
