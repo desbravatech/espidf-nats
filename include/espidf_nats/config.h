@@ -3,7 +3,7 @@
 
 // NATS client identification
 #define NATS_CLIENT_LANG "espidf"
-#define NATS_CLIENT_VERSION "1.2.1"
+#define NATS_CLIENT_VERSION "1.3.0"
 
 // Configuration options (can be overridden before including)
 #ifndef NATS_CONF_VERBOSE
@@ -74,7 +74,14 @@
 #define NATS_WEBSOCKET_RECONNECT_TIMEOUT 10000
 #endif
 
-// Logging tag (inline to avoid ODR violations)
-inline const char* tag = "espidf-nats";
+#ifndef NATS_WEBSOCKET_SEND_TIMEOUT_MS
+#define NATS_WEBSOCKET_SEND_TIMEOUT_MS 10000
+#endif
+
+// Logging tags - namespaced to avoid global symbol collisions
+// Transport classes use their own static constexpr TAG members
+namespace NATSUtil {
+    inline constexpr const char* log_tag = "espidf-nats";
+}
 
 #endif // ESPIDF_NATS_CONFIG_H

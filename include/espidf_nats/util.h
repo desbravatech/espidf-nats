@@ -140,28 +140,66 @@ namespace NATSUtil {
                 len--;
             }
 
-            void empty() {
+            void clear() {
                 len = 0;
                 cap = 32;
                 free(data);
                 data = NULL;  // Set to NULL before malloc to avoid dangling pointer
                 data = (T*)malloc(cap * sizeof(T));
                 if (data == NULL) {
-                    ESP_LOGE("Array", "Failed to allocate array in empty()");
+                    ESP_LOGE("Array", "Failed to allocate array in clear()");
                     cap = 0;
                 }
             }
 
-            T const& operator[](size_t i) const { return data[i]; }
+            bool empty() const { return len == 0; }
+
+            T const& operator[](size_t i) const {
+                // Bounds check for const access (read-only)
+                if (data == NULL || i >= len) {
+                    ESP_LOGE("Array", "Out of bounds const access: index %zu, size %zu", i, len);
+                    // Return reference to static default to avoid crash
+                    static T default_val{};
+                    return default_val;
+                }
+                return data[i];
+            }
 
             T& operator[](size_t i) {
-                while (i >= cap) resize();
+                // For write access, grow if needed
+                while (i >= cap) {
+                    size_t old_cap = cap;
+                    resize();
+                    if (cap <= old_cap || data == NULL) {
+                        ESP_LOGE("Array", "operator[] resize failed for index %zu", i);
+                        static T default_val{};
+                        return default_val;
+                    }
+                }
+                if (data == NULL) {
+                    ESP_LOGE("Array", "operator[] failed: array storage is NULL");
+                    static T default_val{};
+                    return default_val;
+                }
+                // Extend len if writing beyond current size
+                if (i >= len) len = i + 1;
                 return data[i];
             }
 
             size_t push_back(T v) {
+                if (len >= cap) {
+                    resize();
+                    // Check if resize actually worked
+                    if (len >= cap) {
+                        ESP_LOGE("Array", "push_back failed: resize failed at capacity %zu", cap);
+                        return SIZE_MAX;  // Signal failure
+                    }
+                }
+                if (data == NULL) {
+                    ESP_LOGE("Array", "push_back failed: no backing storage");
+                    return SIZE_MAX;
+                }
                 size_t i = len++;
-                if (len > cap) resize();
                 data[i] = v;
                 return i;
             }
@@ -212,20 +250,27 @@ namespace NATSUtil {
                 len++;
             }
 
-            T pop() {
+            // Safe pop - returns false if empty
+            bool pop(T& out) {
                 if (head == NULL) {
-                    // Should not happen if caller checks empty()
-                    return T();
+                    return false;
                 }
                 Node* oldHead = head;
-                T data = oldHead->data;
+                out = oldHead->data;
                 head = oldHead->next;
                 if (head == NULL) {
                     tail = NULL;
                 }
-                delete oldHead;  // Fix: Use delete for objects created with new
+                delete oldHead;
                 len--;
-                return data;
+                return true;
+            }
+
+            // Legacy pop - returns T() if empty (unsafe for types where T() is a valid value)
+            T pop() {
+                T result{};
+                pop(result);
+                return result;
             }
 
             T peek() {
@@ -414,6 +459,103 @@ namespace NATSUtil {
             return capacity;
         }
     };
+
+    /**
+     * Base64 encode data
+     * Used for encoding NKey signatures in CONNECT
+     */
+    inline int base64_encode(const uint8_t* src, size_t src_len, char* dst, size_t dst_size) {
+        static const char b64chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        size_t needed = ((src_len + 2) / 3) * 4 + 1;
+        if (dst_size < needed) return -1;
+
+        size_t j = 0;
+        for (size_t i = 0; i < src_len; i += 3) {
+            uint32_t a = src[i];
+            uint32_t b = (i + 1 < src_len) ? src[i + 1] : 0;
+            uint32_t c = (i + 2 < src_len) ? src[i + 2] : 0;
+            uint32_t triple = (a << 16) | (b << 8) | c;
+
+            dst[j++] = b64chars[(triple >> 18) & 0x3F];
+            dst[j++] = b64chars[(triple >> 12) & 0x3F];
+            dst[j++] = (i + 1 < src_len) ? b64chars[(triple >> 6) & 0x3F] : '=';
+            dst[j++] = (i + 2 < src_len) ? b64chars[triple & 0x3F] : '=';
+        }
+        dst[j] = '\0';
+        return (int)j;
+    }
+
+    /**
+     * Parse a NATS .creds file to extract JWT and NKey seed
+     *
+     * .creds file format:
+     * -----BEGIN NATS USER JWT-----
+     * <jwt token>
+     * ------END NATS USER JWT------
+     *
+     * ************************* IMPORTANT *************************
+     * NKEY Seed printed below can be used to sign and prove identity.
+     * NKEYs are sensitive and should be treated as secrets.
+     *
+     * -----BEGIN USER NKEY SEED-----
+     * <nkey seed starting with 'S'>
+     * ------END USER NKEY SEED------
+     *
+     * @param creds_data The .creds file contents (null-terminated string)
+     * @param jwt Output: pointer to JWT string (caller must free)
+     * @param nkey_seed Output: pointer to NKey seed string (caller must free)
+     * @return true if both JWT and seed were found
+     */
+    inline bool parse_creds_file(const char* creds_data, char** jwt, char** nkey_seed) {
+        if (creds_data == NULL || jwt == NULL || nkey_seed == NULL) return false;
+        *jwt = NULL;
+        *nkey_seed = NULL;
+
+        // Find JWT
+        const char* jwt_begin = strstr(creds_data, "-----BEGIN NATS USER JWT-----");
+        if (jwt_begin != NULL) {
+            jwt_begin += strlen("-----BEGIN NATS USER JWT-----");
+            // Skip whitespace
+            while (*jwt_begin == '\n' || *jwt_begin == '\r' || *jwt_begin == ' ') jwt_begin++;
+            const char* jwt_end = strstr(jwt_begin, "------END NATS USER JWT------");
+            if (jwt_end != NULL) {
+                // Trim trailing whitespace
+                while (jwt_end > jwt_begin && (*(jwt_end-1) == '\n' || *(jwt_end-1) == '\r' || *(jwt_end-1) == ' ')) jwt_end--;
+                size_t jwt_len = jwt_end - jwt_begin;
+                *jwt = (char*)malloc(jwt_len + 1);
+                if (*jwt != NULL) {
+                    memcpy(*jwt, jwt_begin, jwt_len);
+                    (*jwt)[jwt_len] = '\0';
+                }
+            }
+        }
+
+        // Find NKey seed
+        const char* seed_begin = strstr(creds_data, "-----BEGIN USER NKEY SEED-----");
+        if (seed_begin != NULL) {
+            seed_begin += strlen("-----BEGIN USER NKEY SEED-----");
+            while (*seed_begin == '\n' || *seed_begin == '\r' || *seed_begin == ' ') seed_begin++;
+            const char* seed_end = strstr(seed_begin, "------END USER NKEY SEED------");
+            if (seed_end != NULL) {
+                while (seed_end > seed_begin && (*(seed_end-1) == '\n' || *(seed_end-1) == '\r' || *(seed_end-1) == ' ')) seed_end--;
+                size_t seed_len = seed_end - seed_begin;
+                *nkey_seed = (char*)malloc(seed_len + 1);
+                if (*nkey_seed != NULL) {
+                    memcpy(*nkey_seed, seed_begin, seed_len);
+                    (*nkey_seed)[seed_len] = '\0';
+                }
+            }
+        }
+
+        // Both JWT and seed are required for a complete .creds file
+        if (*jwt == NULL || *nkey_seed == NULL) {
+            if (*jwt != NULL) { secure_free(*jwt); *jwt = NULL; }
+            if (*nkey_seed != NULL) { secure_free(*nkey_seed); *nkey_seed = NULL; }
+            return false;
+        }
+
+        return true;
+    }
 
 }; // namespace NATSUtil
 

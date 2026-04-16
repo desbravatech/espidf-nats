@@ -11,6 +11,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
+#include <cJSON.h>
 #include <esp_log.h>
 #include <esp_tls.h>
 #include <mbedtls/ssl.h>
@@ -42,6 +43,11 @@
 #include "ws_transport.h"
 #endif
 
+// Logging tag scoped to this translation unit (avoids global 'tag' collision)
+namespace {
+    constexpr const char* tag = NATSUtil::log_tag;
+}
+
 typedef void (*event_cb)();
 typedef void (*connect_cb)(bool success);
 
@@ -62,7 +68,10 @@ class NATS {
         NatsTransport* transport;
         bool owns_transport;  // true if NATS owns the transport (delete in destructor)
 
-        // Legacy members kept for backward compatibility (used when transport is NULL)
+        // Legacy TCP/TLS members (used when transport is NULL)
+        // TODO(#6): Remove legacy socket path; always use NatsTransport abstraction.
+        //           This will eliminate ~1500 lines of duplicated TCP/TLS/STARTTLS code
+        //           that already exists in tcp_transport.h
         int sockfd;
         esp_tls_t* tls;
         // mbedtls contexts for STARTTLS upgrade
@@ -77,6 +86,8 @@ class NATS {
         size_t current_server_idx;
         const char* user;
         const char* pass;
+        nats_auth_config_t auth_config;
+        char server_nonce[256];        // Server nonce from INFO for NKey signing
 
         NATSUtil::Array<Sub*> subs;
         NATSUtil::Queue<size_t> free_sids;
@@ -91,6 +102,7 @@ class NATS {
 
         ConnectState connect_state;
         connect_cb async_connect_cb;
+        int log_tick_count;
 
         nats_connection_metrics_t metrics;
         nats_error_code_t last_error_code;
@@ -99,6 +111,7 @@ class NATS {
         SemaphoreHandle_t mutex;          // Protects data structures (subs, pending_messages)
         SemaphoreHandle_t io_mutex;       // Protects TLS/socket I/O operations
         SemaphoreHandle_t state_mutex;    // Protects outstanding_pings and reconnect_attempts
+        SemaphoreHandle_t recv_mutex;     // Protects recv() from concurrent access
 
     public:
         bool connected;
@@ -154,6 +167,8 @@ class NATS {
             last_reconnect_attempt(0),
             connect_state(DISCONNECTED),
             async_connect_cb(NULL),
+            log_tick_count(0),
+            last_error_code(NATS_ERR_NONE),
             connected(false),
             max_outstanding_pings(3),
             max_reconnect_attempts(-1),
@@ -187,6 +202,8 @@ class NATS {
                 } else {
                     memset(&tls_config, 0, sizeof(nats_tls_config_t));
                 }
+                memset(&auth_config, 0, sizeof(nats_auth_config_t));
+                memset(server_nonce, 0, sizeof(server_nonce));
                 memset(&metrics, 0, sizeof(nats_connection_metrics_t));
                 last_error_code = (last_error_code == NATS_ERR_INVALID_ARG) ? NATS_ERR_INVALID_ARG : NATS_ERR_NONE;
                 draining = false;
@@ -194,13 +211,15 @@ class NATS {
                 mutex = xSemaphoreCreateRecursiveMutex();
                 io_mutex = xSemaphoreCreateRecursiveMutex();
                 state_mutex = xSemaphoreCreateRecursiveMutex();
-                if (mutex == NULL || io_mutex == NULL || state_mutex == NULL) {
+                recv_mutex = xSemaphoreCreateRecursiveMutex();
+                if (mutex == NULL || io_mutex == NULL || state_mutex == NULL || recv_mutex == NULL) {
                     ESP_LOGE(tag, "Failed to create mutex - out of memory");
                     last_error_code = NATS_ERR_OUT_OF_MEMORY;
                     if (mutex != NULL) vSemaphoreDelete(mutex);
                     if (io_mutex != NULL) vSemaphoreDelete(io_mutex);
                     if (state_mutex != NULL) vSemaphoreDelete(state_mutex);
-                    mutex = io_mutex = state_mutex = NULL;
+                    if (recv_mutex != NULL) vSemaphoreDelete(recv_mutex);
+                    mutex = io_mutex = state_mutex = recv_mutex = NULL;
                 } else {
                     // Validate TLS configuration if provided
                     if (!validate_tls_config()) {
@@ -250,6 +269,8 @@ class NATS {
             last_reconnect_attempt(0),
             connect_state(DISCONNECTED),
             async_connect_cb(NULL),
+            log_tick_count(0),
+            last_error_code(NATS_ERR_NONE),
             connected(false),
             max_outstanding_pings(3),
             max_reconnect_attempts(-1),
@@ -302,6 +323,8 @@ class NATS {
                 } else {
                     memset(&tls_config, 0, sizeof(nats_tls_config_t));
                 }
+                memset(&auth_config, 0, sizeof(nats_auth_config_t));
+                memset(server_nonce, 0, sizeof(server_nonce));
                 memset(&metrics, 0, sizeof(nats_connection_metrics_t));
                 last_error_code = NATS_ERR_NONE;
                 draining = false;
@@ -309,13 +332,15 @@ class NATS {
                 mutex = xSemaphoreCreateRecursiveMutex();
                 io_mutex = xSemaphoreCreateRecursiveMutex();
                 state_mutex = xSemaphoreCreateRecursiveMutex();
-                if (mutex == NULL || io_mutex == NULL || state_mutex == NULL) {
+                recv_mutex = xSemaphoreCreateRecursiveMutex();
+                if (mutex == NULL || io_mutex == NULL || state_mutex == NULL || recv_mutex == NULL) {
                     ESP_LOGE(tag, "Failed to create mutex - out of memory");
                     last_error_code = NATS_ERR_OUT_OF_MEMORY;
                     if (mutex != NULL) vSemaphoreDelete(mutex);
                     if (io_mutex != NULL) vSemaphoreDelete(io_mutex);
                     if (state_mutex != NULL) vSemaphoreDelete(state_mutex);
-                    mutex = io_mutex = state_mutex = NULL;
+                    if (recv_mutex != NULL) vSemaphoreDelete(recv_mutex);
+                    mutex = io_mutex = state_mutex = recv_mutex = NULL;
                 } else {
                     // Validate TLS configuration if provided
                     if (!validate_tls_config()) {
@@ -370,6 +395,10 @@ class NATS {
                 if (state_mutex != NULL) {
                     vSemaphoreDelete(state_mutex);
                     state_mutex = NULL;
+                }
+                if (recv_mutex != NULL) {
+                    vSemaphoreDelete(recv_mutex);
+                    recv_mutex = NULL;
                 }
             }
         }
@@ -582,6 +611,28 @@ class NATS {
 #endif // CONFIG_ESP_WEBSOCKET_CLIENT_ENABLE
 
         /**
+         * Set authentication configuration
+         *
+         * @param config Authentication configuration
+         *
+         * @note For NKey auth, you must provide a sign_fn callback that performs
+         *       ed25519 signing. ESP-IDF's mbedtls may support this via
+         *       mbedtls_pk_sign() with MBEDTLS_PK_EDDSA type (ESP-IDF v5.1+).
+         *
+         * @note For .creds file auth, parse the file first with
+         *       NATSUtil::parse_creds_file() and pass the resulting config here.
+         */
+        void set_auth(const nats_auth_config_t* config) {
+            if (config != NULL) {
+                auth_config = *config;
+                // Set legacy user/pass if using that method
+                if (config->method == NATS_AUTH_USER_PASS) {
+                    // user and pass are already set via constructor
+                }
+            }
+        }
+
+        /**
          * Set a custom transport (advanced usage)
          *
          * @param t Transport instance
@@ -703,6 +754,7 @@ class NATS {
             return success;
         }
 
+        // TODO(#6): Remove legacy socket send path - use transport->send_line()
         void send(const char* msg) {
             if (msg == NULL) return;
             size_t len = strlen(msg);
@@ -788,7 +840,7 @@ class NATS {
             metrics.bytes_sent += len + strlen(NATS_CR_LF);
         }
 
-        // Binary-safe send - sends data with explicit length (no strlen)
+        // TODO(#6): Remove legacy socket send_binary path
         void send_binary(const uint8_t* data, size_t len) {
             if (data == NULL || len == 0) return;
             ssize_t ret;
@@ -904,46 +956,183 @@ class NATS {
         }
 
         void send_connect() {
-            // Build CONNECT JSON - only include user/pass if credentials are provided
+            // Build CONNECT JSON with appropriate auth fields
             // Include headers:true to enable HPUB/HMSG support
             // Include no_responders:true to get fast failure on request/reply with no subscribers
-            if (user != NULL && pass != NULL) {
-                send_fmt(
-                        "CONNECT {"
-                            "\"verbose\":%s,"
-                            "\"pedantic\":%s,"
-                            "\"lang\":\"%s\","
-                            "\"version\":\"%s\","
-                            "\"protocol\":1,"
-                            "\"headers\":true,"
-                            "\"no_responders\":true,"
-                            "\"user\":\"%s\","
-                            "\"pass\":\"%s\""
-                        "}",
-                        NATS_CONF_VERBOSE? "true" : "false",
-                        NATS_CONF_PEDANTIC? "true" : "false",
-                        NATS_CLIENT_LANG,
-                        NATS_CLIENT_VERSION,
-                        user,
-                        pass);
-            } else {
-                send_fmt(
-                        "CONNECT {"
-                            "\"verbose\":%s,"
-                            "\"pedantic\":%s,"
-                            "\"lang\":\"%s\","
-                            "\"version\":\"%s\","
-                            "\"protocol\":1,"
-                            "\"headers\":true,"
-                            "\"no_responders\":true"
-                        "}",
-                        NATS_CONF_VERBOSE? "true" : "false",
-                        NATS_CONF_PEDANTIC? "true" : "false",
-                        NATS_CLIENT_LANG,
-                        NATS_CLIENT_VERSION);
+            const size_t buf_size = 2048;
+            char* buf = (char*)malloc(buf_size);
+            if (buf == NULL) {
+                ESP_LOGE(tag, "Failed to allocate CONNECT buffer");
+                last_error_code = NATS_ERR_OUT_OF_MEMORY;
+                return;
             }
+
+            int offset = snprintf(buf, buf_size,
+                "CONNECT {"
+                    "\"verbose\":%s,"
+                    "\"pedantic\":%s,"
+                    "\"lang\":\"%s\","
+                    "\"version\":\"%s\","
+                    "\"protocol\":1,"
+                    "\"headers\":true,"
+                    "\"no_responders\":true",
+                NATS_CONF_VERBOSE ? "true" : "false",
+                NATS_CONF_PEDANTIC ? "true" : "false",
+                NATS_CLIENT_LANG,
+                NATS_CLIENT_VERSION);
+            if (offset < 0 || (size_t)offset >= buf_size) {
+                ESP_LOGE(tag, "CONNECT buffer overflow");
+                NATSUtil::secure_free(buf);
+                return;
+            }
+
+            // Add authentication fields based on method
+            switch (auth_config.method) {
+                case NATS_AUTH_USER_PASS:
+                    if (user != NULL && pass != NULL) {
+                        // Escape credentials to prevent JSON injection
+                        char escaped_user[NATS_MAX_CREDENTIAL_LEN * 2 + 1];
+                        char escaped_pass[NATS_MAX_CREDENTIAL_LEN * 2 + 1];
+                        if (json_escape(user, escaped_user, sizeof(escaped_user)) < 0 ||
+                            json_escape(pass, escaped_pass, sizeof(escaped_pass)) < 0) {
+                            ESP_LOGE(tag, "Failed to escape credentials");
+                            NATSUtil::secure_free(buf);
+                            return;
+                        }
+                        int n = snprintf(buf + offset, buf_size - offset,
+                            ",\"user\":\"%s\",\"pass\":\"%s\"", escaped_user, escaped_pass);
+                        if (n < 0 || (size_t)n >= (buf_size - (size_t)offset)) {
+                            ESP_LOGE(tag, "CONNECT buffer overflow");
+                            NATSUtil::secure_free(buf);
+                            return;
+                        }
+                        offset += n;
+                    }
+                    break;
+
+                case NATS_AUTH_TOKEN:
+                    if (auth_config.token != NULL) {
+                        int n = snprintf(buf + offset, buf_size - offset,
+                            ",\"auth_token\":\"%s\"", auth_config.token);
+                        if (n < 0 || (size_t)n >= (buf_size - (size_t)offset)) {
+                            ESP_LOGE(tag, "CONNECT buffer overflow");
+                            NATSUtil::secure_free(buf);
+                            return;
+                        }
+                        offset += n;
+                    }
+                    break;
+
+                case NATS_AUTH_NKEY:
+                case NATS_AUTH_CREDENTIALS:
+                    // Validate NKey auth requirements
+                    if (auth_config.nkey_seed != NULL && auth_config.sign_fn == NULL) {
+                        ESP_LOGE(tag, "NKey auth requires sign_fn callback");
+                        last_error_code = NATS_ERR_INVALID_CONFIG;
+                        NATSUtil::secure_free(buf);
+                        return;
+                    }
+                    if (auth_config.nkey_seed != NULL && server_nonce[0] == '\0') {
+                        ESP_LOGW(tag, "NKey auth: no server nonce received, signature will be skipped");
+                    }
+                    // JWT token
+                    if (auth_config.jwt != NULL) {
+                        int n = snprintf(buf + offset, buf_size - offset,
+                            ",\"jwt\":\"%s\"", auth_config.jwt);
+                        if (n < 0 || (size_t)n >= (buf_size - (size_t)offset)) {
+                            ESP_LOGE(tag, "CONNECT buffer overflow");
+                            NATSUtil::secure_free(buf);
+                            return;
+                        }
+                        offset += n;
+                    }
+                    // NKey signature (sign server nonce with seed)
+                    if (auth_config.nkey_seed != NULL && auth_config.sign_fn != NULL && server_nonce[0] != '\0') {
+                        if (auth_config.nkey_public == NULL) {
+                            ESP_LOGE(tag, "NKey auth requires nkey_public key");
+                            last_error_code = NATS_ERR_INVALID_CONFIG;
+                            NATSUtil::secure_free(buf);
+                            return;
+                        }
+                        uint8_t signature[64];
+                        size_t sig_len = 0;
+                        if (auth_config.sign_fn(
+                                (const uint8_t*)server_nonce, strlen(server_nonce),
+                                signature, &sig_len,
+                                auth_config.nkey_seed)) {
+                            if (sig_len != 64) {
+                                ESP_LOGE(tag, "NKey signature has unexpected length: %zu (expected 64)", sig_len);
+                            } else {
+                                // Base64-encode signature for CONNECT
+                                char sig_b64[128];
+                                int b64_ret = NATSUtil::base64_encode(signature, sig_len, sig_b64, sizeof(sig_b64));
+                                if (b64_ret < 0) {
+                                    ESP_LOGE(tag, "Failed to base64-encode NKey signature");
+                                } else {
+                                    int n = snprintf(buf + offset, buf_size - offset,
+                                        ",\"sig\":\"%s\"", sig_b64);
+                                    if (n < 0 || (size_t)n >= (buf_size - (size_t)offset)) {
+                                        ESP_LOGE(tag, "CONNECT buffer overflow");
+                                        NATSUtil::secure_free(buf);
+                                        return;
+                                    }
+                                    offset += n;
+                                    // Include nkey public key
+                                    if (auth_config.nkey_public != NULL) {
+                                        int n2 = snprintf(buf + offset, buf_size - offset,
+                                            ",\"nkey\":\"%s\"", auth_config.nkey_public);
+                                        if (n2 < 0 || (size_t)n2 >= (buf_size - (size_t)offset)) {
+                                            ESP_LOGE(tag, "CONNECT buffer overflow");
+                                            NATSUtil::secure_free(buf);
+                                            return;
+                                        }
+                                        offset += n2;
+                                    }
+                                }
+                            }
+                        } else {
+                            ESP_LOGE(tag, "NKey signature failed");
+                        }
+                    }
+                    break;
+
+                case NATS_AUTH_NONE:
+                default:
+                    // Legacy fallback: use user/pass if set via constructor
+                    if (user != NULL && pass != NULL) {
+                        char escaped_user[NATS_MAX_CREDENTIAL_LEN * 2 + 1];
+                        char escaped_pass[NATS_MAX_CREDENTIAL_LEN * 2 + 1];
+                        if (json_escape(user, escaped_user, sizeof(escaped_user)) < 0 ||
+                            json_escape(pass, escaped_pass, sizeof(escaped_pass)) < 0) {
+                            ESP_LOGE(tag, "Failed to escape credentials");
+                            NATSUtil::secure_free(buf);
+                            return;
+                        }
+                        int n = snprintf(buf + offset, buf_size - offset,
+                            ",\"user\":\"%s\",\"pass\":\"%s\"", escaped_user, escaped_pass);
+                        if (n < 0 || (size_t)n >= (buf_size - (size_t)offset)) {
+                            ESP_LOGE(tag, "CONNECT buffer overflow");
+                            NATSUtil::secure_free(buf);
+                            return;
+                        }
+                        offset += n;
+                    }
+                    break;
+            }
+
+            // Close JSON
+            int close_n = snprintf(buf + offset, buf_size - offset, "}");
+            if (close_n < 0 || (size_t)close_n >= (buf_size - (size_t)offset)) {
+                ESP_LOGE(tag, "CONNECT buffer overflow at close");
+                NATSUtil::secure_free(buf);
+                return;
+            }
+
+            send(buf);
+            NATSUtil::secure_free(buf);
         }
 
+        // TODO(#6): Remove legacy socket read_bytes path - use transport->read_bytes()
         /**
          * Read exactly n bytes from socket (for binary payloads like MSG/HMSG)
          * Does NOT interpret \r or \n specially - reads raw bytes
@@ -1009,6 +1198,7 @@ class NATS {
             return buf;
         }
 
+        // TODO(#6): Remove legacy socket skip_bytes path - use transport->skip_bytes()
         /**
          * Skip exactly n bytes from socket (consume trailing \r\n after payloads)
          */
@@ -1053,6 +1243,7 @@ class NATS {
             if (io_mutex != NULL) xSemaphoreGiveRecursive(io_mutex);
         }
 
+        // TODO(#6): Remove legacy socket readline path - use transport->read_line()
         char* client_readline(size_t cap = 128) {
             // Use transport if available
             if (transport != NULL && transport->is_connected()) {
@@ -1143,6 +1334,88 @@ class NATS {
 
         void recv() {
             char* buf = client_readline();
+
+            // Handle INFO before strtok to preserve JSON integrity
+            // (strtok splits on spaces and would destroy the JSON payload)
+            if (strncmp(buf, "INFO ", 5) == 0) {
+                const char* json_str = buf + 5;
+                while (*json_str == ' ') json_str++;  // Skip extra whitespace
+
+                bool server_tls_required = false;
+                if (*json_str == '{') {
+                    cJSON* info_json = cJSON_Parse(json_str);
+                    if (info_json != NULL) {
+                        // Extract max_payload
+                        cJSON* max_payload_item = cJSON_GetObjectItemCaseSensitive(info_json, "max_payload");
+                        if (cJSON_IsNumber(max_payload_item) && max_payload_item->valuedouble > 0) {
+                            server_max_payload = (size_t)max_payload_item->valuedouble;
+                            ESP_LOGI(tag, "Server max_payload: %zu bytes", server_max_payload);
+                        }
+                        // Check if server requires TLS
+                        cJSON* tls_required_item = cJSON_GetObjectItemCaseSensitive(info_json, "tls_required");
+                        if (cJSON_IsTrue(tls_required_item)) {
+                            server_tls_required = true;
+                            ESP_LOGI(tag, "Server requires TLS");
+                        }
+                        // Extract server nonce for NKey authentication
+                        server_nonce[0] = '\0';  // Clear stale nonce before parsing new INFO
+                        cJSON* nonce_item = cJSON_GetObjectItemCaseSensitive(info_json, "nonce");
+                        if (cJSON_IsString(nonce_item) && nonce_item->valuestring != NULL) {
+                            size_t nonce_len = strlen(nonce_item->valuestring);
+                            if (nonce_len < sizeof(server_nonce)) {
+                                memcpy(server_nonce, nonce_item->valuestring, nonce_len);
+                                server_nonce[nonce_len] = '\0';
+                                ESP_LOGD(tag, "Server nonce: %s", server_nonce);
+                            }
+                        }
+                        cJSON_Delete(info_json);
+                    } else {
+                        ESP_LOGW(tag, "Failed to parse INFO JSON");
+                    }
+                }
+
+                // NATS STARTTLS: Upgrade to TLS if server requires it and TLS is configured.
+                // Guard against upgrading a connection that's already TLS: if tls (esp-tls
+                // handle) is set, or mbedtls direct is in use, we're already encrypted —
+                // attempting upgrade_to_tls() on a TLS socket fails and wedges reconnect.
+                if (server_tls_required && transport == NULL) {
+                    bool already_tls = (tls != NULL) || using_mbedtls_directly;
+                    if (already_tls) {
+                        ESP_LOGI(tag, "Server requires TLS - already secured (native TLS)");
+                    } else {
+                        if (!tls_config.enabled) {
+                            ESP_LOGE(tag, "Server requires TLS but TLS not configured");
+                            last_error_code = NATS_ERR_TLS_CONNECTION_FAILED;
+                            disconnect();
+                            free(buf);
+                            return;
+                        }
+                        if (!upgrade_to_tls()) {
+                            ESP_LOGE(tag, "TLS upgrade failed");
+                            disconnect();
+                            free(buf);
+                            return;
+                        }
+                    }
+                } else if (server_tls_required && transport != NULL) {
+                    ESP_LOGI(tag, "Server requires TLS - already secured via transport (wss://)");
+                }
+
+                // Only perform handshake on first INFO (avoid duplicate CONNECT on async INFO updates)
+                if (!connected) {
+                    send_connect();
+                    connected = true;
+                    restore_subscriptions();
+                    if (on_connect != NULL) on_connect();
+                    send_pending_messages();
+                } else {
+                    // Already connected - just update server capabilities
+                    ESP_LOGD(tag, "Received async INFO update (already connected)");
+                }
+                free(buf);
+                return;
+            }
+
             size_t argc = 0;
             const char* argv[NATS_MAX_ARGV] = {};
             for (int i = 0; i < NATS_MAX_ARGV; i++) {
@@ -1198,6 +1471,8 @@ class NATS {
                 if (sub != NULL && !sub->is_marked_for_deletion()) {
                     // Add reference to prevent deletion during callback
                     sub->add_ref();
+                    // Clear timeout under mutex to prevent races with timeout check
+                    sub->clear_timeout();
                     // Cache whether this will max out BEFORE calling callback
                     will_max_out = (sub->max_wanted > 0 && sub->received + 1 >= sub->max_wanted);
                 } else {
@@ -1206,8 +1481,6 @@ class NATS {
                 xSemaphoreGiveRecursive(mutex);
 
                 if (sub != NULL) {
-                    // Clear timeout to prevent stale timeout callbacks
-                    sub->clear_timeout();
                     // Call user callback WITHOUT holding mutex to prevent deadlock
                     sub->call(e);
 
@@ -1283,6 +1556,19 @@ class NATS {
                 metrics.msgs_received++;
                 metrics.bytes_received += total_size;
 
+                // Auto-respond to JetStream flow-control heartbeats (Status: 100)
+                // Flow control messages are headers-only with a reply-to that must be echoed back
+                if (data_size == 0 && e.reply != NULL && e.reply[0] != '\0' && header_buf != NULL) {
+                    if (strstr(header_buf, "Status: 100") != NULL) {
+                        ESP_LOGD(tag, "Auto-responding to flow control heartbeat -> %s", e.reply);
+                        publish(e.reply, "");
+                        // Don't deliver flow control messages to user callbacks
+                        free(full_buf);
+                        free(buf);
+                        return;
+                    }
+                }
+
                 // Get callback and cache maxed check using reference counting (Issues #1, #7)
                 xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
                 Sub* sub = subs[sid];
@@ -1290,6 +1576,8 @@ class NATS {
                 if (sub != NULL && !sub->is_marked_for_deletion()) {
                     // Add reference to prevent deletion during callback
                     sub->add_ref();
+                    // Clear timeout under mutex to prevent races with timeout check
+                    sub->clear_timeout();
                     // Cache whether this will max out BEFORE calling callback
                     will_max_out = (sub->max_wanted > 0 && sub->received + 1 >= sub->max_wanted);
                 } else {
@@ -1298,8 +1586,6 @@ class NATS {
                 xSemaphoreGiveRecursive(mutex);
 
                 if (sub != NULL) {
-                    // Clear timeout to prevent stale timeout callbacks
-                    sub->clear_timeout();
                     // Call user callback WITHOUT holding mutex to prevent deadlock
                     sub->call(e);
 
@@ -1339,63 +1625,7 @@ class NATS {
                 outstanding_pings--;
                 if (state_mutex != NULL) xSemaphoreGiveRecursive(state_mutex);
             }
-            else if (strcmp(argv[0], NATS_CTRL_INFO) == 0) {
-                // Parse INFO JSON for server capabilities (Issue #58)
-                bool server_tls_required = false;
-                if (argc > 1 && argv[1] != NULL) {
-                    // Extract max_payload from INFO JSON
-                    const char* max_payload_key = "\"max_payload\":";
-                    const char* pos = strstr(argv[1], max_payload_key);
-                    if (pos != NULL) {
-                        pos += strlen(max_payload_key);
-                        size_t parsed_max = 0;
-                        while (*pos >= '0' && *pos <= '9') {
-                            parsed_max = parsed_max * 10 + (*pos - '0');
-                            pos++;
-                        }
-                        if (parsed_max > 0) {
-                            server_max_payload = parsed_max;
-                            ESP_LOGI(tag, "Server max_payload: %zu bytes", server_max_payload);
-                        }
-                    }
-                    // Check if server requires TLS (STARTTLS style)
-                    if (strstr(argv[1], "\"tls_required\":true") != NULL) {
-                        server_tls_required = true;
-                        ESP_LOGI(tag, "Server requires TLS");
-                    }
-                }
-
-                // NATS STARTTLS: Upgrade to TLS if server requires it and TLS is configured
-                // Note: Skip TLS upgrade for transport connections (WebSocket) since:
-                // - wss:// already provides TLS at the transport layer
-                // - ws:// cannot be upgraded to TLS mid-connection
-                if (server_tls_required && transport == NULL) {
-                    if (!tls_config.enabled) {
-                        ESP_LOGE(tag, "Server requires TLS but TLS not configured");
-                        last_error_code = NATS_ERR_TLS_CONNECTION_FAILED;
-                        disconnect();
-                        free(buf);
-                        return;
-                    }
-                    if (!upgrade_to_tls()) {
-                        ESP_LOGE(tag, "TLS upgrade failed");
-                        disconnect();
-                        free(buf);
-                        return;
-                    }
-                } else if (server_tls_required && transport != NULL) {
-                    // For WebSocket transport, TLS is handled at transport level (wss://)
-                    ESP_LOGI(tag, "Server requires TLS - already secured via transport (wss://)");
-                }
-
-                send_connect();
-                connected = true;
-                // Restore existing subscriptions on reconnect (Issues #39, #55)
-                restore_subscriptions();
-                if (on_connect != NULL) on_connect();
-                // Send any pending messages that were buffered while offline
-                send_pending_messages();
-            }
+            // INFO is handled before strtok (see above) to preserve JSON integrity
             free(buf);
         }
 
@@ -1694,6 +1924,84 @@ class NATS {
             if (restored > 0) {
                 ESP_LOGI(tag, "Restored %zu subscriptions after reconnect", restored);
             }
+            if (restored > NATS_MAX_SUBSCRIPTIONS) {
+                ESP_LOGW(tag, "Restored %zu subscriptions (exceeds limit %d) - server may reject some",
+                         restored, NATS_MAX_SUBSCRIPTIONS);
+            }
+        }
+
+        /**
+         * Internal subscription creation - all subscription creation goes through here
+         * Handles SID allocation, limit checking, and optional SUB command sending
+         *
+         * @param subject Subject to subscribe to
+         * @param cb Callback for messages
+         * @param queue Queue group (optional, NULL for none)
+         * @param max_wanted Maximum messages to receive (0 for unlimited)
+         * @param timeout_ms Timeout in milliseconds (0 for no timeout)
+         * @param on_timeout Timeout callback
+         * @param send_sub Whether to send SUB command to server (false for temporary inbox subs that don't need restore)
+         * @return SID on success, -1 on failure
+         */
+        int sub_internal(const char* subject, sub_cb cb, const char* queue = NULL,
+                         int max_wanted = 0, unsigned long timeout_ms = 0,
+                         timeout_cb on_timeout = NULL, bool send_sub = true) {
+            if (subject == NULL || cb == NULL) {
+                last_error_code = NATS_ERR_INVALID_ARG;
+                return -1;
+            }
+
+            // Validate subject (CR/LF injection check)
+            if (contains_crlf(subject) || contains_crlf(queue)) {
+                ESP_LOGE(tag, "Subject or queue contains CR/LF (protocol injection attempt)");
+                last_error_code = NATS_ERR_INVALID_ARG;
+                return -1;
+            }
+
+            xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
+
+            // Enforce subscription limit
+            size_t active_subs = subs.size() - free_sids.size();
+            if (active_subs >= NATS_MAX_SUBSCRIPTIONS) {
+                ESP_LOGE(tag, "Subscription limit reached: %zu (max %d)", active_subs, NATS_MAX_SUBSCRIPTIONS);
+                xSemaphoreGiveRecursive(mutex);
+                last_error_code = NATS_ERR_TOO_MANY_SUBS;
+                return -1;
+            }
+
+            // Create subscription with subject/queue for potential restore
+            // Only store subject if send_sub is true (persistent subs that need restore)
+            Sub* sub = new Sub(cb, max_wanted, timeout_ms, on_timeout,
+                               send_sub ? subject : NULL,
+                               send_sub ? queue : NULL);
+            if (sub == NULL) {
+                xSemaphoreGiveRecursive(mutex);
+                last_error_code = NATS_ERR_OUT_OF_MEMORY;
+                return -1;
+            }
+
+            int sid;
+            if (free_sids.empty()) {
+                sid = subs.push_back(sub);
+            } else {
+                sid = free_sids.pop();
+                subs[sid] = sub;
+            }
+
+            // Send SUB command to server if connected
+            if (connected && send_sub) {
+                if (queue != NULL && queue[0] != '\0') {
+                    send_fmt("SUB %s %s %d", subject, queue, sid);
+                } else {
+                    send_fmt("SUB %s %d", subject, sid);
+                }
+            } else if (connected) {
+                // For temporary subs (inboxes), still send SUB but don't store for restore
+                send_fmt("SUB %s %d", subject, sid);
+            }
+
+            xSemaphoreGiveRecursive(mutex);
+            return sid;
         }
 
         void send_pending_messages() {
@@ -1731,7 +2039,7 @@ class NATS {
         }
 
     private:
-        // Static callback functions for mbedtls bio
+        // TODO(#6): Remove - duplicated in TcpTransport
         static int mbedtls_net_send_cb(void* ctx, const unsigned char* buf, size_t len) {
             int fd = *((int*)ctx);
             int ret = ::send(fd, buf, len, 0);
@@ -1756,7 +2064,7 @@ class NATS {
             return ret;
         }
 
-        // Clean up mbedtls resources
+        // TODO(#6): Remove - duplicated in TcpTransport::cleanup_mbedtls()
         void cleanup_mbedtls() {
             if (mbedtls_ssl) {
                 mbedtls_ssl_free(mbedtls_ssl);
@@ -1786,8 +2094,8 @@ class NATS {
             using_mbedtls_directly = false;
         }
 
-        // Upgrade existing plain TCP socket to TLS (STARTTLS style)
-        // Uses mbedtls directly since esp_tls doesn't support STARTTLS
+        // TODO(#6): Remove - duplicated in TcpTransport::upgrade_to_tls()
+        //           Legacy STARTTLS path missing crt_bundle_attach support
         bool upgrade_to_tls() {
             if (!tls_config.enabled || sockfd < 0) {
                 return false;
@@ -1970,7 +2278,9 @@ class NATS {
                     while (!connected && (NATSUtil::millis() - start_time) < timeout_ms) {
                         // Check for incoming data
                         if (transport->has_data_available(100)) {  // 100ms timeout
+                            if (recv_mutex != NULL) xSemaphoreTakeRecursive(recv_mutex, portMAX_DELAY);
                             recv();  // Process INFO message, send CONNECT
+                            if (recv_mutex != NULL) xSemaphoreGiveRecursive(recv_mutex);
                         }
                         vTaskDelay(pdMS_TO_TICKS(10));
                     }
@@ -2001,6 +2311,7 @@ class NATS {
             return false;
         }
 
+        // TODO(#6): Remove - duplicated in TcpTransport::try_connect_to_host()
         bool try_connect_to_server(const nats_server_t& server) {
             // NATS uses STARTTLS style: always connect plain TCP first,
             // then upgrade to TLS after receiving INFO with tls_required
@@ -2146,7 +2457,9 @@ class NATS {
                             FD_SET(fd_to_check, &rfds);
                             int ret = select(fd_to_check + 1, &rfds, NULL, NULL, &tv);
                             if (ret > 0 && FD_ISSET(fd_to_check, &rfds)) {
+                                if (recv_mutex != NULL) xSemaphoreTakeRecursive(recv_mutex, portMAX_DELAY);
                                 recv();  // Process INFO message, send CONNECT
+                                if (recv_mutex != NULL) xSemaphoreGiveRecursive(recv_mutex);
                             }
                         }
                         vTaskDelay(pdMS_TO_TICKS(10));  // Small delay to prevent busy loop
@@ -2184,6 +2497,7 @@ class NATS {
 
         void disconnect() {
             if (!connected && (transport == NULL || !transport->is_connected())) return;
+            last_reconnect_attempt = NATSUtil::millis();
             connected = false;
             connect_state = DISCONNECTED;
             async_connect_cb = NULL;
@@ -2229,8 +2543,6 @@ class NATS {
             disconnect();
 
             // Clean up subscriptions with mutex protection
-            // Note: We set elements to NULL but don't resize the array
-            // since NATSUtil::Array doesn't have a clear() method
             if (mutex != NULL) {
                 xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
                 for (size_t i = 0; i < subs.size(); i++) {
@@ -2308,6 +2620,12 @@ class NATS {
                 last_error_code = NATS_ERR_INVALID_ARG;
                 return;
             }
+            // Validate data pointer
+            if (data == NULL && data_len > 0) {
+                ESP_LOGE(tag, "publish_binary: data is NULL but data_len is %zu", data_len);
+                last_error_code = NATS_ERR_INVALID_ARG;
+                return;
+            }
             // Enforce server max_payload limit
             if (data_len > server_max_payload) {
                 ESP_LOGE(tag, "Binary message too large: %zu bytes (server max: %zu)", data_len, server_max_payload);
@@ -2315,7 +2633,10 @@ class NATS {
                 return;
             }
             if (!connected) {
-                // Can't buffer binary data easily, just skip
+                // Binary messages cannot be buffered (pending_msg_t is string-based)
+                // Set error code so caller knows the message was dropped
+                ESP_LOGW(tag, "Binary publish dropped: not connected (binary messages are not buffered)");
+                last_error_code = NATS_ERR_NOT_CONNECTED;
                 return;
             }
             // PUB protocol: PUB <subject> [reply-to] <#bytes>\r\n[payload]\r\n
@@ -2429,47 +2750,16 @@ class NATS {
         }
 
         int subscribe(const char* subject, sub_cb cb, const char* queue = NULL, const int max_wanted = 0) {
-            if (!connected) return -1;
+            if (!connected) {
+                last_error_code = NATS_ERR_NOT_CONNECTED;
+                return -1;
+            }
             // Validate subject format (Issues #26, #41) - wildcards allowed in subscribe
-            if (!validate_subject_format(subject, true)) {  // true = wildcards allowed
+            if (!validate_subject_format(subject, true)) {
                 last_error_code = NATS_ERR_INVALID_SUBJECT;
                 return -1;
             }
-            // Prevent protocol injection via CR/LF in subject or queue
-            if (contains_crlf(subject) || contains_crlf(queue)) {
-                ESP_LOGE(tag, "Subject or queue contains CR/LF (protocol injection attempt)");
-                last_error_code = NATS_ERR_INVALID_ARG;
-                return -1;
-            }
-
-            xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
-
-            // Enforce subscription limit
-            size_t active_subs = subs.size() - free_sids.size();
-            if (active_subs >= NATS_MAX_SUBSCRIPTIONS) {
-                ESP_LOGE(tag, "Subscription limit reached: %zu (max %d)", active_subs, NATS_MAX_SUBSCRIPTIONS);
-                xSemaphoreGiveRecursive(mutex);
-                last_error_code = NATS_ERR_TOO_MANY_SUBS;
-                return -1;
-            }
-
-            // Store subject/queue for reconnection restoration (Issues #39, #55)
-            Sub* sub = new Sub(cb, max_wanted, 0, NULL, subject, queue);
-            int sid;
-            if (free_sids.empty()) {
-                sid = subs.push_back(sub);
-            } else {
-                sid = free_sids.pop();
-                subs[sid] = sub;
-            }
-            // SUB protocol: SUB <subject> [queue group] <sid>
-            if (queue != NULL && queue[0] != '\0') {
-                send_fmt("SUB %s %s %d", subject, queue, sid);
-            } else {
-                send_fmt("SUB %s %d", subject, sid);
-            }
-            xSemaphoreGiveRecursive(mutex);
-            return sid;
+            return sub_internal(subject, cb, queue, max_wanted, 0, NULL, true);
         }
 
         void unsubscribe(const int sid) {
@@ -2524,17 +2814,12 @@ class NATS {
                 return -1;
             }
 
-            xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
-            Sub* sub = new Sub(cb, max_wanted, timeout_ms, on_timeout);
-            int sid;
-            if (free_sids.empty()) {
-                sid = subs.push_back(sub);
-            } else {
-                sid = free_sids.pop();
-                subs[sid] = sub;
+            // Use sub_internal with send_sub=false (inbox doesn't need restore on reconnect)
+            int sid = sub_internal(inbox, cb, NULL, max_wanted, timeout_ms, on_timeout, false);
+            if (sid < 0) {
+                free(inbox);
+                return -1;
             }
-            send_fmt("SUB %s %d", inbox, sid);
-            xSemaphoreGiveRecursive(mutex);
 
             publish(subject, msg, inbox);
             free(inbox);
@@ -2550,31 +2835,21 @@ class NATS {
             if (subject == NULL || subject[0] == 0) return -1;
             if (!connected) return -1;
 
-            // Generate inbox for receiving the JetStream ACK
             char* inbox = generate_inbox_subject();
             if (inbox == NULL) return -1;
 
-            // Subscribe to inbox first to receive ACK
-            xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
-            Sub* sub = new Sub(ack_cb, 1, timeout_ms, on_timeout);
-            int sid;
-            if (free_sids.empty()) {
-                sid = subs.push_back(sub);
-            } else {
-                sid = free_sids.pop();
-                subs[sid] = sub;
+            // Use sub_internal for inbox subscription
+            int sid = sub_internal(inbox, ack_cb, NULL, 1, timeout_ms, on_timeout, false);
+            if (sid < 0) {
+                free(inbox);
+                return -1;
             }
-            send_fmt("SUB %s %d", inbox, sid);
-            xSemaphoreGiveRecursive(mutex);
 
             if (msg_id != NULL) {
-                // Use headers for message deduplication
                 char headers[256];
                 snprintf(headers, sizeof(headers), "NATS/1.0\r\nNats-Msg-Id: %s\r\n\r\n", msg_id);
-                // Publish directly to subject (not an API endpoint) with reply-to inbox
                 publish_with_headers(subject, headers, msg, inbox);
             } else {
-                // Publish directly to subject with reply-to inbox for ACK
                 publish(subject, msg, inbox);
             }
 
@@ -2593,20 +2868,35 @@ class NATS {
             char* json = (char*)malloc(json_size);
             if (json == NULL) return -1;
 
-            int offset = snprintf(json, json_size, "{\"name\":\"%s\",\"subjects\":[", config->name);
+            // Escape user-supplied strings to prevent JSON injection
+            char escaped_name[NATS_MAX_SUBJECT_LEN * 2 + 1];
+            if (json_escape(config->name, escaped_name, sizeof(escaped_name)) < 0) {
+                ESP_LOGE(tag, "Failed to escape name (too long)");
+                free(json);
+                return -1;
+            }
+
+            int offset = snprintf(json, json_size, "{\"name\":\"%s\",\"subjects\":[", escaped_name);
             if (offset >= (int)json_size) { free(json); return -1; }
 
             // Add subjects array
             if (config->subjects != NULL) {
                 bool first = true;
+                size_t subject_count = 0;
                 for (size_t i = 0; i < NATS_MAX_SUBJECTS && config->subjects[i] != NULL; i++) {
                     if (!first) {
                         offset += snprintf(json + offset, json_size - offset, ",");
                         if (offset >= (int)json_size) { free(json); return -1; }
                     }
-                    offset += snprintf(json + offset, json_size - offset, "\"%s\"", config->subjects[i]);
+                    char escaped_subject[NATS_MAX_SUBJECT_LEN * 2 + 1];
+                    json_escape(config->subjects[i], escaped_subject, sizeof(escaped_subject));
+                    offset += snprintf(json + offset, json_size - offset, "\"%s\"", escaped_subject);
                     if (offset >= (int)json_size) { free(json); return -1; }
                     first = false;
+                    subject_count++;
+                }
+                if (subject_count >= NATS_MAX_SUBJECTS) {
+                    ESP_LOGW(tag, "Stream subjects reached limit (%d) - array may not be NULL-terminated", NATS_MAX_SUBJECTS);
                 }
             }
             offset += snprintf(json + offset, json_size - offset, "]");
@@ -2630,7 +2920,9 @@ class NATS {
                 if (offset >= (int)json_size) { free(json); return -1; }
             }
             if (config->storage != NULL) {
-                offset += snprintf(json + offset, json_size - offset, ",\"storage\":\"%s\"", config->storage);
+                char escaped_storage[64];
+                json_escape(config->storage, escaped_storage, sizeof(escaped_storage));
+                offset += snprintf(json + offset, json_size - offset, ",\"storage\":\"%s\"", escaped_storage);
                 if (offset >= (int)json_size) { free(json); return -1; }
             }
             if (config->replicas > 0) {
@@ -2645,7 +2937,7 @@ class NATS {
             snprintf(json + offset, json_size - offset, "}");
 
             // JetStream API uses stream name in subject path
-            char api_subject[256];
+            char api_subject[1024];
             snprintf(api_subject, sizeof(api_subject), "$JS.API.STREAM.CREATE.%s", config->name);
 
             int sid = request_with_timeout(api_subject, json, response_cb, timeout_ms, on_timeout, 1);
@@ -2659,7 +2951,7 @@ class NATS {
             if (stream_name == NULL) return -1;
             if (!connected) return -1;
 
-            char api_subject[256];
+            char api_subject[1024];
             snprintf(api_subject, sizeof(api_subject), "$JS.API.STREAM.DELETE.%s", stream_name);
 
             return request_with_timeout(api_subject, "", response_cb, timeout_ms, on_timeout, 1);
@@ -2671,7 +2963,7 @@ class NATS {
             if (stream_name == NULL) return -1;
             if (!connected) return -1;
 
-            char api_subject[256];
+            char api_subject[1024];
             snprintf(api_subject, sizeof(api_subject), "$JS.API.STREAM.INFO.%s", stream_name);
 
             return request_with_timeout(api_subject, "", response_cb, timeout_ms, on_timeout, 1);
@@ -2689,16 +2981,28 @@ class NATS {
             char* json = (char*)malloc(json_size);
             if (json == NULL) return -1;
 
+            // Escape user-supplied strings to prevent JSON injection
+            char escaped_stream_name[256];
+            if (json_escape(config->stream_name, escaped_stream_name, sizeof(escaped_stream_name)) < 0) {
+                ESP_LOGE(tag, "Failed to escape stream name (too long)");
+                free(json);
+                return -1;
+            }
+
             // Start with stream_name and config wrapper
-            int offset = snprintf(json, json_size, "{\"stream_name\":\"%s\",\"config\":{", config->stream_name);
+            int offset = snprintf(json, json_size, "{\"stream_name\":\"%s\",\"config\":{", escaped_stream_name);
             if (offset >= (int)json_size) { free(json); return -1; }
 
             if (config->durable_name != NULL) {
-                offset += snprintf(json + offset, json_size - offset, "\"durable_name\":\"%s\",", config->durable_name);
+                char escaped_durable[256];
+                json_escape(config->durable_name, escaped_durable, sizeof(escaped_durable));
+                offset += snprintf(json + offset, json_size - offset, "\"durable_name\":\"%s\",", escaped_durable);
                 if (offset >= (int)json_size) { free(json); return -1; }
             }
             if (config->filter_subject != NULL) {
-                offset += snprintf(json + offset, json_size - offset, "\"filter_subject\":\"%s\",", config->filter_subject);
+                char escaped_filter[256];
+                json_escape(config->filter_subject, escaped_filter, sizeof(escaped_filter));
+                offset += snprintf(json + offset, json_size - offset, "\"filter_subject\":\"%s\",", escaped_filter);
                 if (offset >= (int)json_size) { free(json); return -1; }
             }
             if (config->deliver_all) {
@@ -2709,7 +3013,9 @@ class NATS {
                 if (offset >= (int)json_size) { free(json); return -1; }
             }
             if (config->ack_policy != NULL) {
-                offset += snprintf(json + offset, json_size - offset, "\"ack_policy\":\"%s\",", config->ack_policy);
+                char escaped_ack[64];
+                json_escape(config->ack_policy, escaped_ack, sizeof(escaped_ack));
+                offset += snprintf(json + offset, json_size - offset, "\"ack_policy\":\"%s\",", escaped_ack);
                 if (offset >= (int)json_size) { free(json); return -1; }
             }
             if (config->ack_wait > 0) {
@@ -2721,7 +3027,9 @@ class NATS {
                 if (offset >= (int)json_size) { free(json); return -1; }
             }
             if (config->replay_policy != NULL) {
-                offset += snprintf(json + offset, json_size - offset, "\"replay_policy\":\"%s\",", config->replay_policy);
+                char escaped_replay[64];
+                json_escape(config->replay_policy, escaped_replay, sizeof(escaped_replay));
+                offset += snprintf(json + offset, json_size - offset, "\"replay_policy\":\"%s\",", escaped_replay);
                 if (offset >= (int)json_size) { free(json); return -1; }
             }
 
@@ -2733,7 +3041,7 @@ class NATS {
             // Use correct API endpoint based on consumer type (NATS 2.10+ format):
             // - Named (durable): $JS.API.CONSUMER.CREATE.<stream>.<consumer_name>
             // - Ephemeral: $JS.API.CONSUMER.CREATE.<stream>
-            char api_subject[512];
+            char api_subject[1024];
             if (config->durable_name != NULL) {
                 snprintf(api_subject, sizeof(api_subject), "$JS.API.CONSUMER.CREATE.%s.%s",
                         config->stream_name, config->durable_name);
@@ -2753,7 +3061,7 @@ class NATS {
             if (stream_name == NULL || consumer_name == NULL) return -1;
             if (!connected) return -1;
 
-            char api_subject[256];
+            char api_subject[1024];
             snprintf(api_subject, sizeof(api_subject), "$JS.API.CONSUMER.DELETE.%s.%s",
                     stream_name, consumer_name);
 
@@ -2763,15 +3071,21 @@ class NATS {
         // Pull messages from a JetStream consumer
         int jetstream_pull(const char* stream_name, const char* consumer_name, int batch_size,
                           sub_cb message_cb, timeout_cb on_timeout = NULL,
-                          unsigned long timeout_ms = 5000) {
+                          unsigned long timeout_ms = 5000, bool no_wait = true) {
             if (stream_name == NULL || consumer_name == NULL || batch_size <= 0) return -1;
             if (!connected) return -1;
 
             // Build pull request
             char json[128];
-            snprintf(json, sizeof(json), "{\"batch\":%d,\"no_wait\":true}", batch_size);
+            if (no_wait) {
+                snprintf(json, sizeof(json), "{\"batch\":%d,\"no_wait\":true}", batch_size);
+            } else {
+                // Long-poll mode: let the request expire based on timeout
+                int64_t expires_ns = (int64_t)timeout_ms * 1000000LL;
+                snprintf(json, sizeof(json), "{\"batch\":%d,\"expires\":%lld}", batch_size, expires_ns);
+            }
 
-            char api_subject[256];
+            char api_subject[1024];
             snprintf(api_subject, sizeof(api_subject), "$JS.API.CONSUMER.MSG.NEXT.%s.%s",
                     stream_name, consumer_name);
 
@@ -2834,7 +3148,7 @@ class NATS {
 
             snprintf(json + offset, sizeof(json) - offset, "}");
 
-            char api_subject[256];
+            char api_subject[1024];
             snprintf(api_subject, sizeof(api_subject), "$JS.API.CONSUMER.MSG.NEXT.%s.%s",
                     stream_name, consumer_name);
 
@@ -2883,7 +3197,7 @@ class NATS {
             offset += snprintf(json + offset, json_size - offset, "}}");
             if (offset >= (int)json_size) { free(json); return -1; }
 
-            char api_subject[256];
+            char api_subject[1024];
             snprintf(api_subject, sizeof(api_subject), "$JS.API.CONSUMER.CREATE.%s", stream_name);
 
             int sid = request_with_timeout(api_subject, json, response_cb, timeout_ms, on_timeout, 1);
@@ -2904,9 +3218,17 @@ class NATS {
             char* json = (char*)malloc(json_size);
             if (json == NULL) return -1;
 
+            // Escape user-supplied strings to prevent JSON injection
+            char escaped_bucket[256];
+            if (json_escape(config->bucket, escaped_bucket, sizeof(escaped_bucket)) < 0) {
+                ESP_LOGE(tag, "Failed to escape bucket name (too long)");
+                free(json);
+                return -1;
+            }
+
             // Stream name is "KV_<bucket>" - DON'T close the object yet with ]}
             int offset = snprintf(json, json_size, "{\"name\":\"KV_%s\",\"subjects\":[\"$KV.%s.>\"]",
-                                config->bucket, config->bucket);
+                                escaped_bucket, escaped_bucket);
             if (offset >= (int)json_size) { free(json); return -1; }
 
             // KV-specific stream configuration
@@ -2934,7 +3256,9 @@ class NATS {
 
             // Storage type
             if (config->storage != NULL) {
-                offset += snprintf(json + offset, json_size - offset, ",\"storage\":\"%s\"", config->storage);
+                char escaped_storage[64];
+                json_escape(config->storage, escaped_storage, sizeof(escaped_storage));
+                offset += snprintf(json + offset, json_size - offset, ",\"storage\":\"%s\"", escaped_storage);
                 if (offset >= (int)json_size) { free(json); return -1; }
             }
 
@@ -2955,7 +3279,7 @@ class NATS {
             if (offset >= (int)json_size) { free(json); return -1; }
 
             // Use correct API endpoint with stream name in subject
-            char api_subject[256];
+            char api_subject[1024];
             snprintf(api_subject, sizeof(api_subject), "$JS.API.STREAM.CREATE.KV_%s", config->bucket);
 
             int sid = request_with_timeout(api_subject, json, response_cb, timeout_ms, on_timeout, 1);
@@ -2974,13 +3298,19 @@ class NATS {
             char* json = (char*)malloc(json_size);
             if (json == NULL) return -1;
 
-            int offset = snprintf(json, json_size, "{\"last_by_subj\":\"$KV.%s.%s\"}", bucket, key);
+            // Escape user-supplied strings to prevent JSON injection
+            char escaped_bucket[256];
+            json_escape(bucket, escaped_bucket, sizeof(escaped_bucket));
+            char escaped_key[256];
+            json_escape(key, escaped_key, sizeof(escaped_key));
+
+            int offset = snprintf(json, json_size, "{\"last_by_subj\":\"$KV.%s.%s\"}", escaped_bucket, escaped_key);
             if (offset >= (int)json_size) { free(json); return -1; }
 
-            char stream_name[512];
+            char stream_name[1024];
             snprintf(stream_name, sizeof(stream_name), "KV_%s", bucket);
 
-            char api_subject[512];
+            char api_subject[1024];
             int ret = snprintf(api_subject, sizeof(api_subject), "$JS.API.STREAM.MSG.GET.%s", stream_name);
             if (ret >= (int)sizeof(api_subject)) { free(json); return -1; }
 
@@ -3017,17 +3347,11 @@ class NATS {
             char* inbox = generate_inbox_subject();
             if (inbox == NULL) return -1;
 
-            xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
-            Sub* sub = new Sub(ack_cb, 1, timeout_ms, on_timeout);
-            int sid;
-            if (free_sids.empty()) {
-                sid = subs.push_back(sub);
-            } else {
-                sid = free_sids.pop();
-                subs[sid] = sub;
+            int sid = sub_internal(inbox, ack_cb, NULL, 1, timeout_ms, on_timeout, false);
+            if (sid < 0) {
+                free(inbox);
+                return -1;
             }
-            send_fmt("SUB %s %d", inbox, sid);
-            xSemaphoreGiveRecursive(mutex);
 
             publish_with_headers(subject, headers, "", inbox);
             free(inbox);
@@ -3049,17 +3373,11 @@ class NATS {
             char* inbox = generate_inbox_subject();
             if (inbox == NULL) return -1;
 
-            xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
-            Sub* sub = new Sub(ack_cb, 1, timeout_ms, on_timeout);
-            int sid;
-            if (free_sids.empty()) {
-                sid = subs.push_back(sub);
-            } else {
-                sid = free_sids.pop();
-                subs[sid] = sub;
+            int sid = sub_internal(inbox, ack_cb, NULL, 1, timeout_ms, on_timeout, false);
+            if (sid < 0) {
+                free(inbox);
+                return -1;
             }
-            send_fmt("SUB %s %d", inbox, sid);
-            xSemaphoreGiveRecursive(mutex);
 
             publish_with_headers(subject, headers, "", inbox);
             free(inbox);
@@ -3073,7 +3391,7 @@ class NATS {
             if (!connected) return -1;
 
             // Get stream info to list keys
-            char stream_name[256];
+            char stream_name[1024];
             snprintf(stream_name, sizeof(stream_name), "KV_%s", bucket);
 
             return jetstream_stream_info(stream_name, response_cb, on_timeout, timeout_ms);
@@ -3099,7 +3417,7 @@ class NATS {
             if (!connected) return -1;
 
             // Create a consumer to get all messages for this key
-            char stream_name[256];
+            char stream_name[1024];
             snprintf(stream_name, sizeof(stream_name), "KV_%s", bucket);
 
             char filter_subject[256];
@@ -3130,9 +3448,20 @@ class NATS {
             if (config == NULL || config->bucket == NULL) return -1;
             if (!connected) return -1;
 
+            // Escape user-supplied strings to prevent JSON injection
+            char escaped_bucket[256];
+            if (json_escape(config->bucket, escaped_bucket, sizeof(escaped_bucket)) < 0) {
+                ESP_LOGE(tag, "Failed to escape bucket name (too long)");
+                return -1;
+            }
+            char escaped_storage[64];
+            json_escape(config->storage ? config->storage : "file", escaped_storage, sizeof(escaped_storage));
+
             // Object store is a JetStream stream named OBJ_<bucket>
-            char stream_name[256];
-            snprintf(stream_name, sizeof(stream_name), "OBJ_%s", config->bucket);
+            // Buffer sized to hold prefix + max-length escaped bucket (which is
+            // already bounded at 256 by escaped_bucket above) without truncation.
+            char stream_name[1024];
+            snprintf(stream_name, sizeof(stream_name), "OBJ_%s", escaped_bucket);
 
             // Build stream configuration JSON
             char payload[1024];
@@ -3143,15 +3472,17 @@ class NATS {
                 "\"num_replicas\":%d,"
                 "\"discard\":\"new\"",
                 stream_name,
-                config->bucket,
-                config->bucket,
-                config->storage ? config->storage : "file",
+                escaped_bucket,
+                escaped_bucket,
+                escaped_storage,
                 config->replicas > 0 ? config->replicas : 1
             );
 
             if (config->description != NULL) {
+                char escaped_desc[512];
+                json_escape(config->description, escaped_desc, sizeof(escaped_desc));
                 len += snprintf(payload + len, sizeof(payload) - len,
-                    ",\"description\":\"%s\"", config->description);
+                    ",\"description\":\"%s\"", escaped_desc);
             }
 
             if (config->max_bytes > 0) {
@@ -3166,14 +3497,40 @@ class NATS {
 
             snprintf(payload + len, sizeof(payload) - len, "}");
 
-            // Use correct API endpoint with stream name in subject
-            char api_subject[512];
+            // Use correct API endpoint with stream name in subject.
+            // stream_name is bounded via preceding snprintf into a [1024] buffer
+            // with a 4-char prefix — practical max well under 1024 — but gcc's
+            // format-truncation heuristic can't prove it, so suppress locally.
+            char api_subject[1024];
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
             snprintf(api_subject, sizeof(api_subject), "$JS.API.STREAM.CREATE.%s", stream_name);
+#pragma GCC diagnostic pop
 
             return request_with_timeout(api_subject, payload, response_cb, timeout_ms, on_timeout);
         }
 
-        // Put object in object store (complete upload in one call)
+        /**
+         * Put object in object store (complete upload in one call)
+         *
+         * @note Limitations vs. official NATS clients (nats.go, nats.js):
+         *  - SHA-256 digest is not computed (would require mbedtls SHA-256 on ESP32)
+         *  - Chunk subject is $O.<bucket>.C.<nuid> for all chunks (same as spec)
+         *  - Chunk ordering relies on JetStream sequence numbers
+         *  - Metadata format is compatible but does not include digest field
+         *  - For full cross-client compatibility, consider using obj_get_info()
+         *    to verify metadata before consuming objects written by this client
+         *
+         * @param bucket Bucket name
+         * @param name Object name
+         * @param data Object data
+         * @param data_len Data length in bytes
+         * @param description Optional description
+         * @param ack_cb Callback for metadata ACK
+         * @param on_timeout Timeout callback
+         * @param timeout_ms Timeout in milliseconds
+         * @return SID for metadata ACK subscription, or -1 on failure
+         */
         int obj_put(const char* bucket, const char* name, const uint8_t* data, size_t data_len,
                    const char* description, sub_cb ack_cb,
                    timeout_cb on_timeout = NULL, unsigned long timeout_ms = 5000) {
@@ -3197,7 +3554,7 @@ class NATS {
                 size_t chunk_len = (chunk_offset + CHUNK_SIZE > data_len) ?
                                    (data_len - chunk_offset) : CHUNK_SIZE;
 
-                char chunk_subject[256];
+                char chunk_subject[1024];
                 snprintf(chunk_subject, sizeof(chunk_subject),
                          "$O.%s.C.%s", bucket, nuid);
 
@@ -3205,8 +3562,25 @@ class NATS {
                 publish_binary(chunk_subject, data + chunk_offset, chunk_len);
             }
 
+            // Flush to ensure all chunks are sent before metadata
+            // This prevents metadata from arriving before chunk data
+            if (!flush(timeout_ms)) {
+                ESP_LOGE(tag, "Flush before metadata publish timed out - aborting to prevent corrupt object");
+                last_error_code = NATS_ERR_SOCKET_FAILED;
+                return -1;
+            }
+
+            // Escape user-supplied strings to prevent JSON injection
+            char escaped_name[256];
+            if (json_escape(name, escaped_name, sizeof(escaped_name)) < 0) {
+                ESP_LOGE(tag, "Failed to escape object name (too long)");
+                return -1;
+            }
+            char escaped_nuid[48];
+            json_escape(nuid, escaped_nuid, sizeof(escaped_nuid));
+
             // Publish metadata
-            char meta_subject[256];
+            char meta_subject[1024];
             snprintf(meta_subject, sizeof(meta_subject), "$O.%s.M.%s", bucket, name);
 
             char meta_payload[512];
@@ -3214,21 +3588,37 @@ class NATS {
                 "{\"name\":\"%s\","
                 "\"size\":%zu,"
                 "\"chunks\":%llu,"
-                "\"nuid\":\"%s\"",
-                name,
+                "\"nuid\":\"%s\","
+                "\"options\":{\"max_chunk_size\":%zu}",
+                escaped_name,
                 data_len,
                 (unsigned long long)num_chunks,
-                nuid
+                escaped_nuid,
+                CHUNK_SIZE
             );
+            if (len < 0 || (size_t)len >= sizeof(meta_payload)) {
+                ESP_LOGE(tag, "Object metadata too large for buffer");
+                return -1;
+            }
 
             if (description != NULL) {
+                char escaped_desc[256];
+                json_escape(description, escaped_desc, sizeof(escaped_desc));
                 len += snprintf(meta_payload + len, sizeof(meta_payload) - len,
-                    ",\"description\":\"%s\"", description);
+                    ",\"description\":\"%s\"", escaped_desc);
+                if (len < 0 || (size_t)len >= sizeof(meta_payload)) {
+                    ESP_LOGE(tag, "Object metadata too large for buffer (after description)");
+                    return -1;
+                }
             }
 
             // Add timestamp
             len += snprintf(meta_payload + len, sizeof(meta_payload) - len,
                 ",\"mtime\":%llu}", (unsigned long long)(NATSUtil::millis() * 1000000ULL));
+            if (len < 0 || (size_t)len >= sizeof(meta_payload)) {
+                ESP_LOGE(tag, "Object metadata too large for buffer (after mtime)");
+                return -1;
+            }
 
             return jetstream_publish(meta_subject, meta_payload, ack_cb, on_timeout, timeout_ms, NULL);
         }
@@ -3240,20 +3630,24 @@ class NATS {
             if (!connected) return -1;
 
             // Get the metadata message
-            char stream_name[256];
+            char stream_name[1024];
             snprintf(stream_name, sizeof(stream_name), "OBJ_%s", bucket);
 
-            char meta_subject[512];
+            char meta_subject[1024];
             int ret = snprintf(meta_subject, sizeof(meta_subject), "$O.%s.M.%s", bucket, name);
             if (ret >= (int)sizeof(meta_subject)) return -1;
+
+            // Escape subject for JSON payload to prevent injection
+            char escaped_meta_subject[512];
+            json_escape(meta_subject, escaped_meta_subject, sizeof(escaped_meta_subject));
 
             // Use direct get for low latency
             char payload[512];
             ret = snprintf(payload, sizeof(payload),
-                "{\"last_by_subj\":\"%s\"}", meta_subject);
+                "{\"last_by_subj\":\"%s\"}", escaped_meta_subject);
             if (ret >= (int)sizeof(payload)) return -1;
 
-            char api_subject[512];
+            char api_subject[1024];
             ret = snprintf(api_subject, sizeof(api_subject),
                      "$JS.API.STREAM.MSG.GET.%s", stream_name);
             if (ret >= (int)sizeof(api_subject)) return -1;
@@ -3261,22 +3655,38 @@ class NATS {
             return request_with_timeout(api_subject, payload, response_cb, timeout_ms, on_timeout);
         }
 
-        // Get object data (download)
-        int obj_get(const char* bucket, const char* name, sub_cb chunk_cb,
-                   timeout_cb on_timeout = NULL, unsigned long timeout_ms = 30000) {
-            if (bucket == NULL || name == NULL) return -1;
+        /**
+         * Watch for object chunk data in a bucket
+         *
+         * NOTE: This subscribes to ALL chunk subjects in the bucket.
+         * It does NOT download a specific object. For a full download,
+         * use obj_get_info() to get the NUID, then subscribe to
+         * $O.<bucket>.C.<nuid> and reassemble chunks by sequence.
+         *
+         * @param bucket Bucket name
+         * @param chunk_cb Callback for each chunk received
+         * @return Subscription ID, or -1 on failure
+         */
+        int obj_watch_chunks(const char* bucket, sub_cb chunk_cb) {
+            if (bucket == NULL) return -1;
             if (!connected) return -1;
 
-            // First get metadata to find NUID and chunk count
-            // In a real implementation, we'd parse the metadata response
-            // and then fetch each chunk. For this simplified version,
-            // we subscribe to the chunk pattern and let the callback handle assembly
-
-            char chunk_subject[256];
+            char chunk_subject[1024];
             snprintf(chunk_subject, sizeof(chunk_subject), "$O.%s.C.>", bucket);
 
-            // Subscribe to get chunks (caller must handle chunk assembly)
             return subscribe(chunk_subject, chunk_cb, NULL, 0);
+        }
+
+        /**
+         * @deprecated Use obj_watch_chunks() instead. This function does not
+         * actually download an object - it subscribes to all chunk subjects.
+         */
+        int obj_get(const char* bucket, const char* name, sub_cb chunk_cb,
+                   timeout_cb on_timeout = NULL, unsigned long timeout_ms = 30000) {
+            (void)name;  // Not used - subscribes to all chunks
+            (void)on_timeout;
+            (void)timeout_ms;
+            return obj_watch_chunks(bucket, chunk_cb);
         }
 
         // List objects in bucket
@@ -3285,7 +3695,7 @@ class NATS {
             if (bucket == NULL) return -1;
             if (!connected) return -1;
 
-            char stream_name[256];
+            char stream_name[1024];
             snprintf(stream_name, sizeof(stream_name), "OBJ_%s", bucket);
 
             // Get stream info which includes metadata subjects
@@ -3299,7 +3709,7 @@ class NATS {
             if (!connected) return -1;
 
             // Delete metadata message (chunks will be purged by retention policy)
-            char meta_subject[256];
+            char meta_subject[1024];
             snprintf(meta_subject, sizeof(meta_subject), "$O.%s.M.%s", bucket, name);
 
             // Publish delete marker with headers
@@ -3308,17 +3718,11 @@ class NATS {
             char* inbox = generate_inbox_subject();
             if (inbox == NULL) return -1;
 
-            xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
-            Sub* sub = new Sub(ack_cb, 1, timeout_ms, on_timeout);
-            int sid;
-            if (free_sids.empty()) {
-                sid = subs.push_back(sub);
-            } else {
-                sid = free_sids.pop();
-                subs[sid] = sub;
+            int sid = sub_internal(inbox, ack_cb, NULL, 1, timeout_ms, on_timeout, false);
+            if (sid < 0) {
+                free(inbox);
+                return -1;
             }
-            send_fmt("SUB %s %d", inbox, sid);
-            xSemaphoreGiveRecursive(mutex);
 
             publish_with_headers(meta_subject, headers, "", inbox);
             free(inbox);
@@ -3362,11 +3766,15 @@ class NATS {
             if (stream_name == NULL || subject == NULL) return -1;
             if (!connected) return -1;
 
-            char api_subject[256];
+            char api_subject[1024];
             snprintf(api_subject, sizeof(api_subject), "$JS.API.DIRECT.GET.%s", stream_name);
 
+            // Escape subject for JSON payload to prevent injection
+            char escaped_subject[NATS_MAX_SUBJECT_LEN * 2 + 1];
+            json_escape(subject, escaped_subject, sizeof(escaped_subject));
+
             char payload[256];
-            snprintf(payload, sizeof(payload), "{\"last_by_subj\":\"%s\"}", subject);
+            snprintf(payload, sizeof(payload), "{\"last_by_subj\":\"%s\"}", escaped_subject);
 
             return request_with_timeout(api_subject, payload, response_cb, timeout_ms, on_timeout);
         }
@@ -3455,7 +3863,9 @@ class NATS {
                 // Handle transport-based connections (WebSocket)
                 if (transport != NULL) {
                     if (transport->has_data_available(10)) {
+                        if (recv_mutex != NULL) xSemaphoreTakeRecursive(recv_mutex, portMAX_DELAY);
                         recv();
+                        if (recv_mutex != NULL) xSemaphoreGiveRecursive(recv_mutex);
                     }
                     // Yield to prevent watchdog
                     vTaskDelay(pdMS_TO_TICKS(10));
@@ -3475,7 +3885,9 @@ class NATS {
                     FD_SET(fd_to_check, &rfds);
                     int ret = select(fd_to_check + 1, &rfds, NULL, NULL, &tv);
                     if (ret > 0 && FD_ISSET(fd_to_check, &rfds)) {
+                        if (recv_mutex != NULL) xSemaphoreTakeRecursive(recv_mutex, portMAX_DELAY);
                         recv();
+                        if (recv_mutex != NULL) xSemaphoreGiveRecursive(recv_mutex);
                     }
                 }
                 else {
@@ -3525,7 +3937,6 @@ class NATS {
             draining = false;
         }
 
-        int log_tick_count = 0;
         void process() {
             if (log_tick_count++ % 1000 == 0) {
                 //ESP_LOGI(tag, "(tick %d) Outstanding pings: %d, Reconnect attempts: %d", log_tick_count, outstanding_pings, reconnect_attempts);
@@ -3549,7 +3960,9 @@ class NATS {
             if (transport != NULL && transport->is_connected()) {
                 // Check for data using transport
                 if (transport->has_data_available(0)) {
+                    if (recv_mutex != NULL) xSemaphoreTakeRecursive(recv_mutex, portMAX_DELAY);
                     recv();
+                    if (recv_mutex != NULL) xSemaphoreGiveRecursive(recv_mutex);
                 }
 
                 // Check for request timeouts
@@ -3566,10 +3979,18 @@ class NATS {
                 xSemaphoreGiveRecursive(mutex);
 
                 for (size_t i = 0; i < timed_out_sids.size(); i++) {
-                    if (timeout_callbacks[i] != NULL) {
-                        timeout_callbacks[i]();
+                    // Re-check under mutex: response may have arrived since we collected timeouts
+                    xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
+                    Sub* sub = (timed_out_sids[i] >= 0 && (size_t)timed_out_sids[i] < subs.size()) ? subs[timed_out_sids[i]] : NULL;
+                    bool still_timed_out = (sub != NULL && !sub->is_marked_for_deletion() && sub->timed_out());
+                    xSemaphoreGiveRecursive(mutex);
+
+                    if (still_timed_out) {
+                        if (timeout_callbacks[i] != NULL) {
+                            timeout_callbacks[i]();
+                        }
+                        unsubscribe(timed_out_sids[i]);
                     }
-                    unsubscribe(timed_out_sids[i]);
                 }
 
                 if (ping_timer.process())
@@ -3595,7 +4016,9 @@ class NATS {
                 FD_SET(fd_to_check, &rfds);
                 int ret = select(fd_to_check + 1, &rfds, NULL, NULL, &tv);
                 if (ret > 0 && FD_ISSET(fd_to_check, &rfds)) {
+                    if (recv_mutex != NULL) xSemaphoreTakeRecursive(recv_mutex, portMAX_DELAY);
                     recv();
+                    if (recv_mutex != NULL) xSemaphoreGiveRecursive(recv_mutex);
                 }
 
                 // Check for request timeouts
@@ -3614,17 +4037,28 @@ class NATS {
 
                 // Now process timeouts without holding the mutex
                 for (size_t i = 0; i < timed_out_sids.size(); i++) {
-                    if (timeout_callbacks[i] != NULL) {
-                        timeout_callbacks[i]();
+                    // Re-check under mutex: response may have arrived since we collected timeouts
+                    xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
+                    Sub* sub = (timed_out_sids[i] >= 0 && (size_t)timed_out_sids[i] < subs.size()) ? subs[timed_out_sids[i]] : NULL;
+                    bool still_timed_out = (sub != NULL && !sub->is_marked_for_deletion() && sub->timed_out());
+                    xSemaphoreGiveRecursive(mutex);
+
+                    if (still_timed_out) {
+                        if (timeout_callbacks[i] != NULL) {
+                            timeout_callbacks[i]();
+                        }
+                        unsubscribe(timed_out_sids[i]);
                     }
-                    unsubscribe(timed_out_sids[i]);
                 }
 
                 if (ping_timer.process())
                     ping();
-            } else if (transport == NULL) {
-                // Only handle reconnection in legacy mode (no transport)
-                disconnect();
+            } else if (!connected || (transport != NULL && !transport->is_connected())) {
+                // Handle reconnection for both legacy and transport mode
+                if (connected) {
+                    // Transport dropped unexpectedly - force disconnect
+                    disconnect();
+                }
                 // Protect reconnect_attempts read with mutex
                 if (state_mutex != NULL) xSemaphoreTakeRecursive(state_mutex, portMAX_DELAY);
                 int attempts = reconnect_attempts;
