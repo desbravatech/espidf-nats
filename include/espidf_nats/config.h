@@ -74,7 +74,10 @@
 #define NATS_WEBSOCKET_RECONNECT_TIMEOUT 10000
 #endif
 
-// Logging tag (inline to avoid ODR violations)
-inline const char* tag = "espidf-nats";
+// Logging tags - namespaced to avoid global symbol collisions
+// Transport classes use their own static constexpr TAG members
+namespace NATSUtil {
+    inline const char* log_tag = "espidf-nats";
+}
 
 #endif // ESPIDF_NATS_CONFIG_H
