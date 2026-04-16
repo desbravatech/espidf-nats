@@ -958,7 +958,7 @@ class NATS {
                 NATS_CLIENT_VERSION);
             if (offset < 0 || (size_t)offset >= buf_size) {
                 ESP_LOGE(tag, "CONNECT buffer overflow");
-                free(buf);
+                NATSUtil::secure_free(buf);
                 return;
             }
 
@@ -970,7 +970,7 @@ class NATS {
                             ",\"user\":\"%s\",\"pass\":\"%s\"", user, pass);
                         if (offset < 0 || (size_t)offset >= buf_size) {
                             ESP_LOGE(tag, "CONNECT buffer overflow");
-                            free(buf);
+                            NATSUtil::secure_free(buf);
                             return;
                         }
                     }
@@ -982,7 +982,7 @@ class NATS {
                             ",\"auth_token\":\"%s\"", auth_config.token);
                         if (offset < 0 || (size_t)offset >= buf_size) {
                             ESP_LOGE(tag, "CONNECT buffer overflow");
-                            free(buf);
+                            NATSUtil::secure_free(buf);
                             return;
                         }
                     }
@@ -993,7 +993,7 @@ class NATS {
                     // Validate NKey auth requirements
                     if (auth_config.nkey_seed != NULL && auth_config.sign_fn == NULL) {
                         ESP_LOGE(tag, "NKey auth requires sign_fn callback");
-                        free(buf);
+                        NATSUtil::secure_free(buf);
                         return;
                     }
                     if (auth_config.nkey_seed != NULL && server_nonce[0] == '\0') {
@@ -1005,7 +1005,7 @@ class NATS {
                             ",\"jwt\":\"%s\"", auth_config.jwt);
                         if (offset < 0 || (size_t)offset >= buf_size) {
                             ESP_LOGE(tag, "CONNECT buffer overflow");
-                            free(buf);
+                            NATSUtil::secure_free(buf);
                             return;
                         }
                     }
@@ -1030,7 +1030,7 @@ class NATS {
                                         ",\"sig\":\"%s\"", sig_b64);
                                     if (offset < 0 || (size_t)offset >= buf_size) {
                                         ESP_LOGE(tag, "CONNECT buffer overflow");
-                                        free(buf);
+                                        NATSUtil::secure_free(buf);
                                         return;
                                     }
                                     // Include nkey public key
@@ -1039,7 +1039,7 @@ class NATS {
                                             ",\"nkey\":\"%s\"", auth_config.nkey_public);
                                         if (offset < 0 || (size_t)offset >= buf_size) {
                                             ESP_LOGE(tag, "CONNECT buffer overflow");
-                                            free(buf);
+                                            NATSUtil::secure_free(buf);
                                             return;
                                         }
                                     }
@@ -1059,7 +1059,7 @@ class NATS {
                             ",\"user\":\"%s\",\"pass\":\"%s\"", user, pass);
                         if (offset < 0 || (size_t)offset >= buf_size) {
                             ESP_LOGE(tag, "CONNECT buffer overflow");
-                            free(buf);
+                            NATSUtil::secure_free(buf);
                             return;
                         }
                     }
@@ -1494,6 +1494,7 @@ class NATS {
                     }
 
                     // Extract nonce for NKey authentication
+                    server_nonce[0] = '\0';  // Clear stale nonce before parsing new INFO
                     const char* nonce_key = "\"nonce\":\"";
                     const char* nonce_pos = strstr(argv[1], nonce_key);
                     if (nonce_pos != NULL) {
