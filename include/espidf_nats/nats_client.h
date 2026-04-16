@@ -1374,20 +1374,28 @@ class NATS {
                     }
                 }
 
-                // NATS STARTTLS: Upgrade to TLS if server requires it and TLS is configured
+                // NATS STARTTLS: Upgrade to TLS if server requires it and TLS is configured.
+                // Guard against upgrading a connection that's already TLS: if tls (esp-tls
+                // handle) is set, or mbedtls direct is in use, we're already encrypted —
+                // attempting upgrade_to_tls() on a TLS socket fails and wedges reconnect.
                 if (server_tls_required && transport == NULL) {
-                    if (!tls_config.enabled) {
-                        ESP_LOGE(tag, "Server requires TLS but TLS not configured");
-                        last_error_code = NATS_ERR_TLS_CONNECTION_FAILED;
-                        disconnect();
-                        free(buf);
-                        return;
-                    }
-                    if (!upgrade_to_tls()) {
-                        ESP_LOGE(tag, "TLS upgrade failed");
-                        disconnect();
-                        free(buf);
-                        return;
+                    bool already_tls = (tls != NULL) || using_mbedtls_directly;
+                    if (already_tls) {
+                        ESP_LOGI(tag, "Server requires TLS - already secured (native TLS)");
+                    } else {
+                        if (!tls_config.enabled) {
+                            ESP_LOGE(tag, "Server requires TLS but TLS not configured");
+                            last_error_code = NATS_ERR_TLS_CONNECTION_FAILED;
+                            disconnect();
+                            free(buf);
+                            return;
+                        }
+                        if (!upgrade_to_tls()) {
+                            ESP_LOGE(tag, "TLS upgrade failed");
+                            disconnect();
+                            free(buf);
+                            return;
+                        }
                     }
                 } else if (server_tls_required && transport != NULL) {
                     ESP_LOGI(tag, "Server requires TLS - already secured via transport (wss://)");
