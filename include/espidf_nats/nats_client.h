@@ -11,6 +11,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
+#include <cJSON.h>
 #include <esp_log.h>
 #include <esp_tls.h>
 #include <mbedtls/ssl.h>
@@ -908,6 +909,17 @@ class NATS {
             // Include headers:true to enable HPUB/HMSG support
             // Include no_responders:true to get fast failure on request/reply with no subscribers
             if (user != NULL && pass != NULL) {
+                // Escape credentials to prevent JSON injection
+                char escaped_user[NATS_MAX_CREDENTIAL_LEN * 2 + 1];
+                char escaped_pass[NATS_MAX_CREDENTIAL_LEN * 2 + 1];
+                if (json_escape(user, escaped_user, sizeof(escaped_user)) < 0) {
+                    ESP_LOGE(tag, "Failed to escape username (too long)");
+                    return;
+                }
+                if (json_escape(pass, escaped_pass, sizeof(escaped_pass)) < 0) {
+                    ESP_LOGE(tag, "Failed to escape password (too long)");
+                    return;
+                }
                 send_fmt(
                         "CONNECT {"
                             "\"verbose\":%s,"
@@ -924,8 +936,8 @@ class NATS {
                         NATS_CONF_PEDANTIC? "true" : "false",
                         NATS_CLIENT_LANG,
                         NATS_CLIENT_VERSION,
-                        user,
-                        pass);
+                        escaped_user,
+                        escaped_pass);
             } else {
                 send_fmt(
                         "CONNECT {"
@@ -1143,6 +1155,69 @@ class NATS {
 
         void recv() {
             char* buf = client_readline();
+
+            // Handle INFO before strtok to preserve JSON integrity
+            // (strtok splits on spaces and would destroy the JSON payload)
+            if (strncmp(buf, "INFO ", 5) == 0) {
+                const char* json_str = buf + 5;
+                while (*json_str == ' ') json_str++;  // Skip extra whitespace
+
+                bool server_tls_required = false;
+                if (*json_str == '{') {
+                    cJSON* info_json = cJSON_Parse(json_str);
+                    if (info_json != NULL) {
+                        // Extract max_payload
+                        cJSON* max_payload_item = cJSON_GetObjectItemCaseSensitive(info_json, "max_payload");
+                        if (cJSON_IsNumber(max_payload_item) && max_payload_item->valuedouble > 0) {
+                            server_max_payload = (size_t)max_payload_item->valuedouble;
+                            ESP_LOGI(tag, "Server max_payload: %zu bytes", server_max_payload);
+                        }
+                        // Check if server requires TLS
+                        cJSON* tls_required_item = cJSON_GetObjectItemCaseSensitive(info_json, "tls_required");
+                        if (cJSON_IsTrue(tls_required_item)) {
+                            server_tls_required = true;
+                            ESP_LOGI(tag, "Server requires TLS");
+                        }
+                        cJSON_Delete(info_json);
+                    } else {
+                        ESP_LOGW(tag, "Failed to parse INFO JSON");
+                    }
+                }
+
+                // NATS STARTTLS: Upgrade to TLS if server requires it and TLS is configured
+                if (server_tls_required && transport == NULL) {
+                    if (!tls_config.enabled) {
+                        ESP_LOGE(tag, "Server requires TLS but TLS not configured");
+                        last_error_code = NATS_ERR_TLS_CONNECTION_FAILED;
+                        disconnect();
+                        free(buf);
+                        return;
+                    }
+                    if (!upgrade_to_tls()) {
+                        ESP_LOGE(tag, "TLS upgrade failed");
+                        disconnect();
+                        free(buf);
+                        return;
+                    }
+                } else if (server_tls_required && transport != NULL) {
+                    ESP_LOGI(tag, "Server requires TLS - already secured via transport (wss://)");
+                }
+
+                // Only perform handshake on first INFO (avoid duplicate CONNECT on async INFO updates)
+                if (!connected) {
+                    send_connect();
+                    connected = true;
+                    restore_subscriptions();
+                    if (on_connect != NULL) on_connect();
+                    send_pending_messages();
+                } else {
+                    // Already connected - just update server capabilities
+                    ESP_LOGD(tag, "Received async INFO update (already connected)");
+                }
+                free(buf);
+                return;
+            }
+
             size_t argc = 0;
             const char* argv[NATS_MAX_ARGV] = {};
             for (int i = 0; i < NATS_MAX_ARGV; i++) {
@@ -1339,63 +1414,7 @@ class NATS {
                 outstanding_pings--;
                 if (state_mutex != NULL) xSemaphoreGiveRecursive(state_mutex);
             }
-            else if (strcmp(argv[0], NATS_CTRL_INFO) == 0) {
-                // Parse INFO JSON for server capabilities (Issue #58)
-                bool server_tls_required = false;
-                if (argc > 1 && argv[1] != NULL) {
-                    // Extract max_payload from INFO JSON
-                    const char* max_payload_key = "\"max_payload\":";
-                    const char* pos = strstr(argv[1], max_payload_key);
-                    if (pos != NULL) {
-                        pos += strlen(max_payload_key);
-                        size_t parsed_max = 0;
-                        while (*pos >= '0' && *pos <= '9') {
-                            parsed_max = parsed_max * 10 + (*pos - '0');
-                            pos++;
-                        }
-                        if (parsed_max > 0) {
-                            server_max_payload = parsed_max;
-                            ESP_LOGI(tag, "Server max_payload: %zu bytes", server_max_payload);
-                        }
-                    }
-                    // Check if server requires TLS (STARTTLS style)
-                    if (strstr(argv[1], "\"tls_required\":true") != NULL) {
-                        server_tls_required = true;
-                        ESP_LOGI(tag, "Server requires TLS");
-                    }
-                }
-
-                // NATS STARTTLS: Upgrade to TLS if server requires it and TLS is configured
-                // Note: Skip TLS upgrade for transport connections (WebSocket) since:
-                // - wss:// already provides TLS at the transport layer
-                // - ws:// cannot be upgraded to TLS mid-connection
-                if (server_tls_required && transport == NULL) {
-                    if (!tls_config.enabled) {
-                        ESP_LOGE(tag, "Server requires TLS but TLS not configured");
-                        last_error_code = NATS_ERR_TLS_CONNECTION_FAILED;
-                        disconnect();
-                        free(buf);
-                        return;
-                    }
-                    if (!upgrade_to_tls()) {
-                        ESP_LOGE(tag, "TLS upgrade failed");
-                        disconnect();
-                        free(buf);
-                        return;
-                    }
-                } else if (server_tls_required && transport != NULL) {
-                    // For WebSocket transport, TLS is handled at transport level (wss://)
-                    ESP_LOGI(tag, "Server requires TLS - already secured via transport (wss://)");
-                }
-
-                send_connect();
-                connected = true;
-                // Restore existing subscriptions on reconnect (Issues #39, #55)
-                restore_subscriptions();
-                if (on_connect != NULL) on_connect();
-                // Send any pending messages that were buffered while offline
-                send_pending_messages();
-            }
+            // INFO is handled before strtok (see above) to preserve JSON integrity
             free(buf);
         }
 
@@ -2592,7 +2611,15 @@ class NATS {
             char* json = (char*)malloc(json_size);
             if (json == NULL) return -1;
 
-            int offset = snprintf(json, json_size, "{\"name\":\"%s\",\"subjects\":[", config->name);
+            // Escape user-supplied strings to prevent JSON injection
+            char escaped_name[NATS_MAX_SUBJECT_LEN * 2 + 1];
+            if (json_escape(config->name, escaped_name, sizeof(escaped_name)) < 0) {
+                ESP_LOGE(tag, "Failed to escape name (too long)");
+                free(json);
+                return -1;
+            }
+
+            int offset = snprintf(json, json_size, "{\"name\":\"%s\",\"subjects\":[", escaped_name);
             if (offset >= (int)json_size) { free(json); return -1; }
 
             // Add subjects array
@@ -2603,7 +2630,9 @@ class NATS {
                         offset += snprintf(json + offset, json_size - offset, ",");
                         if (offset >= (int)json_size) { free(json); return -1; }
                     }
-                    offset += snprintf(json + offset, json_size - offset, "\"%s\"", config->subjects[i]);
+                    char escaped_subject[NATS_MAX_SUBJECT_LEN * 2 + 1];
+                    json_escape(config->subjects[i], escaped_subject, sizeof(escaped_subject));
+                    offset += snprintf(json + offset, json_size - offset, "\"%s\"", escaped_subject);
                     if (offset >= (int)json_size) { free(json); return -1; }
                     first = false;
                 }
@@ -2629,7 +2658,9 @@ class NATS {
                 if (offset >= (int)json_size) { free(json); return -1; }
             }
             if (config->storage != NULL) {
-                offset += snprintf(json + offset, json_size - offset, ",\"storage\":\"%s\"", config->storage);
+                char escaped_storage[64];
+                json_escape(config->storage, escaped_storage, sizeof(escaped_storage));
+                offset += snprintf(json + offset, json_size - offset, ",\"storage\":\"%s\"", escaped_storage);
                 if (offset >= (int)json_size) { free(json); return -1; }
             }
             if (config->replicas > 0) {
@@ -2688,16 +2719,28 @@ class NATS {
             char* json = (char*)malloc(json_size);
             if (json == NULL) return -1;
 
+            // Escape user-supplied strings to prevent JSON injection
+            char escaped_stream_name[256];
+            if (json_escape(config->stream_name, escaped_stream_name, sizeof(escaped_stream_name)) < 0) {
+                ESP_LOGE(tag, "Failed to escape stream name (too long)");
+                free(json);
+                return -1;
+            }
+
             // Start with stream_name and config wrapper
-            int offset = snprintf(json, json_size, "{\"stream_name\":\"%s\",\"config\":{", config->stream_name);
+            int offset = snprintf(json, json_size, "{\"stream_name\":\"%s\",\"config\":{", escaped_stream_name);
             if (offset >= (int)json_size) { free(json); return -1; }
 
             if (config->durable_name != NULL) {
-                offset += snprintf(json + offset, json_size - offset, "\"durable_name\":\"%s\",", config->durable_name);
+                char escaped_durable[256];
+                json_escape(config->durable_name, escaped_durable, sizeof(escaped_durable));
+                offset += snprintf(json + offset, json_size - offset, "\"durable_name\":\"%s\",", escaped_durable);
                 if (offset >= (int)json_size) { free(json); return -1; }
             }
             if (config->filter_subject != NULL) {
-                offset += snprintf(json + offset, json_size - offset, "\"filter_subject\":\"%s\",", config->filter_subject);
+                char escaped_filter[256];
+                json_escape(config->filter_subject, escaped_filter, sizeof(escaped_filter));
+                offset += snprintf(json + offset, json_size - offset, "\"filter_subject\":\"%s\",", escaped_filter);
                 if (offset >= (int)json_size) { free(json); return -1; }
             }
             if (config->deliver_all) {
@@ -2708,7 +2751,9 @@ class NATS {
                 if (offset >= (int)json_size) { free(json); return -1; }
             }
             if (config->ack_policy != NULL) {
-                offset += snprintf(json + offset, json_size - offset, "\"ack_policy\":\"%s\",", config->ack_policy);
+                char escaped_ack[64];
+                json_escape(config->ack_policy, escaped_ack, sizeof(escaped_ack));
+                offset += snprintf(json + offset, json_size - offset, "\"ack_policy\":\"%s\",", escaped_ack);
                 if (offset >= (int)json_size) { free(json); return -1; }
             }
             if (config->ack_wait > 0) {
@@ -2720,7 +2765,9 @@ class NATS {
                 if (offset >= (int)json_size) { free(json); return -1; }
             }
             if (config->replay_policy != NULL) {
-                offset += snprintf(json + offset, json_size - offset, "\"replay_policy\":\"%s\",", config->replay_policy);
+                char escaped_replay[64];
+                json_escape(config->replay_policy, escaped_replay, sizeof(escaped_replay));
+                offset += snprintf(json + offset, json_size - offset, "\"replay_policy\":\"%s\",", escaped_replay);
                 if (offset >= (int)json_size) { free(json); return -1; }
             }
 
@@ -2903,9 +2950,17 @@ class NATS {
             char* json = (char*)malloc(json_size);
             if (json == NULL) return -1;
 
+            // Escape user-supplied strings to prevent JSON injection
+            char escaped_bucket[256];
+            if (json_escape(config->bucket, escaped_bucket, sizeof(escaped_bucket)) < 0) {
+                ESP_LOGE(tag, "Failed to escape bucket name (too long)");
+                free(json);
+                return -1;
+            }
+
             // Stream name is "KV_<bucket>" - DON'T close the object yet with ]}
             int offset = snprintf(json, json_size, "{\"name\":\"KV_%s\",\"subjects\":[\"$KV.%s.>\"]",
-                                config->bucket, config->bucket);
+                                escaped_bucket, escaped_bucket);
             if (offset >= (int)json_size) { free(json); return -1; }
 
             // KV-specific stream configuration
@@ -2933,7 +2988,9 @@ class NATS {
 
             // Storage type
             if (config->storage != NULL) {
-                offset += snprintf(json + offset, json_size - offset, ",\"storage\":\"%s\"", config->storage);
+                char escaped_storage[64];
+                json_escape(config->storage, escaped_storage, sizeof(escaped_storage));
+                offset += snprintf(json + offset, json_size - offset, ",\"storage\":\"%s\"", escaped_storage);
                 if (offset >= (int)json_size) { free(json); return -1; }
             }
 
@@ -2973,7 +3030,13 @@ class NATS {
             char* json = (char*)malloc(json_size);
             if (json == NULL) return -1;
 
-            int offset = snprintf(json, json_size, "{\"last_by_subj\":\"$KV.%s.%s\"}", bucket, key);
+            // Escape user-supplied strings to prevent JSON injection
+            char escaped_bucket[256];
+            json_escape(bucket, escaped_bucket, sizeof(escaped_bucket));
+            char escaped_key[256];
+            json_escape(key, escaped_key, sizeof(escaped_key));
+
+            int offset = snprintf(json, json_size, "{\"last_by_subj\":\"$KV.%s.%s\"}", escaped_bucket, escaped_key);
             if (offset >= (int)json_size) { free(json); return -1; }
 
             char stream_name[512];
@@ -3129,9 +3192,18 @@ class NATS {
             if (config == NULL || config->bucket == NULL) return -1;
             if (!connected) return -1;
 
+            // Escape user-supplied strings to prevent JSON injection
+            char escaped_bucket[256];
+            if (json_escape(config->bucket, escaped_bucket, sizeof(escaped_bucket)) < 0) {
+                ESP_LOGE(tag, "Failed to escape bucket name (too long)");
+                return -1;
+            }
+            char escaped_storage[64];
+            json_escape(config->storage ? config->storage : "file", escaped_storage, sizeof(escaped_storage));
+
             // Object store is a JetStream stream named OBJ_<bucket>
             char stream_name[256];
-            snprintf(stream_name, sizeof(stream_name), "OBJ_%s", config->bucket);
+            snprintf(stream_name, sizeof(stream_name), "OBJ_%s", escaped_bucket);
 
             // Build stream configuration JSON
             char payload[1024];
@@ -3142,15 +3214,17 @@ class NATS {
                 "\"num_replicas\":%d,"
                 "\"discard\":\"new\"",
                 stream_name,
-                config->bucket,
-                config->bucket,
-                config->storage ? config->storage : "file",
+                escaped_bucket,
+                escaped_bucket,
+                escaped_storage,
                 config->replicas > 0 ? config->replicas : 1
             );
 
             if (config->description != NULL) {
+                char escaped_desc[512];
+                json_escape(config->description, escaped_desc, sizeof(escaped_desc));
                 len += snprintf(payload + len, sizeof(payload) - len,
-                    ",\"description\":\"%s\"", config->description);
+                    ",\"description\":\"%s\"", escaped_desc);
             }
 
             if (config->max_bytes > 0) {
@@ -3204,6 +3278,15 @@ class NATS {
                 publish_binary(chunk_subject, data + chunk_offset, chunk_len);
             }
 
+            // Escape user-supplied strings to prevent JSON injection
+            char escaped_name[256];
+            if (json_escape(name, escaped_name, sizeof(escaped_name)) < 0) {
+                ESP_LOGE(tag, "Failed to escape object name (too long)");
+                return -1;
+            }
+            char escaped_nuid[48];
+            json_escape(nuid, escaped_nuid, sizeof(escaped_nuid));
+
             // Publish metadata
             char meta_subject[256];
             snprintf(meta_subject, sizeof(meta_subject), "$O.%s.M.%s", bucket, name);
@@ -3214,15 +3297,17 @@ class NATS {
                 "\"size\":%zu,"
                 "\"chunks\":%llu,"
                 "\"nuid\":\"%s\"",
-                name,
+                escaped_name,
                 data_len,
                 (unsigned long long)num_chunks,
-                nuid
+                escaped_nuid
             );
 
             if (description != NULL) {
+                char escaped_desc[256];
+                json_escape(description, escaped_desc, sizeof(escaped_desc));
                 len += snprintf(meta_payload + len, sizeof(meta_payload) - len,
-                    ",\"description\":\"%s\"", description);
+                    ",\"description\":\"%s\"", escaped_desc);
             }
 
             // Add timestamp
@@ -3246,10 +3331,14 @@ class NATS {
             int ret = snprintf(meta_subject, sizeof(meta_subject), "$O.%s.M.%s", bucket, name);
             if (ret >= (int)sizeof(meta_subject)) return -1;
 
+            // Escape subject for JSON payload to prevent injection
+            char escaped_meta_subject[512];
+            json_escape(meta_subject, escaped_meta_subject, sizeof(escaped_meta_subject));
+
             // Use direct get for low latency
             char payload[512];
             ret = snprintf(payload, sizeof(payload),
-                "{\"last_by_subj\":\"%s\"}", meta_subject);
+                "{\"last_by_subj\":\"%s\"}", escaped_meta_subject);
             if (ret >= (int)sizeof(payload)) return -1;
 
             char api_subject[512];
@@ -3364,8 +3453,12 @@ class NATS {
             char api_subject[256];
             snprintf(api_subject, sizeof(api_subject), "$JS.API.DIRECT.GET.%s", stream_name);
 
+            // Escape subject for JSON payload to prevent injection
+            char escaped_subject[NATS_MAX_SUBJECT_LEN * 2 + 1];
+            json_escape(subject, escaped_subject, sizeof(escaped_subject));
+
             char payload[256];
-            snprintf(payload, sizeof(payload), "{\"last_by_subj\":\"%s\"}", subject);
+            snprintf(payload, sizeof(payload), "{\"last_by_subj\":\"%s\"}", escaped_subject);
 
             return request_with_timeout(api_subject, payload, response_cb, timeout_ms, on_timeout);
         }

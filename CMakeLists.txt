@@ -17,7 +17,7 @@ endif()
 
 idf_component_register(
     INCLUDE_DIRS include
-    REQUIRES esp-tls lwip ${OPTIONAL_REQUIRES}
+    REQUIRES esp-tls lwip json ${OPTIONAL_REQUIRES}
 )
 
 # Define CONFIG_ESP_WEBSOCKET_CLIENT_ENABLE if WebSocket component is available
