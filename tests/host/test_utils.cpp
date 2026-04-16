@@ -106,15 +106,17 @@ void test_array_erase_oob() {
 }
 
 void test_array_empty_method() {
-    TEST("Array empty() clears and resets");
+    TEST("Array clear()/empty() semantics (post-container-safety)");
     NATSUtil::Array<int> arr(4);
+    ASSERT(arr.empty(), "empty() true when size==0");
     arr.push_back(1);
     arr.push_back(2);
     arr.push_back(3);
-    ASSERT(arr.size() == 3, "size before empty");
-    arr.empty();
-    ASSERT(arr.size() == 0, "size after empty should be 0");
-    // Should be usable after empty
+    ASSERT(arr.size() == 3, "size before clear");
+    ASSERT(!arr.empty(), "empty() false when populated");
+    arr.clear();
+    ASSERT(arr.size() == 0, "size after clear should be 0");
+    ASSERT(arr.empty(), "empty() true after clear");
     arr.push_back(99);
     ASSERT(arr.size() == 1, "size after re-push");
     ASSERT(arr[0] == 99, "value after re-push");
