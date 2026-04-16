@@ -44,7 +44,7 @@
 
 // Logging tag scoped to this translation unit (avoids global 'tag' collision)
 namespace {
-    const char* tag = NATSUtil::log_tag;
+    constexpr const char* tag = NATSUtil::log_tag;
 }
 
 typedef void (*event_cb)();
