@@ -3333,7 +3333,27 @@ class NATS {
             return request_with_timeout(api_subject, payload, response_cb, timeout_ms, on_timeout);
         }
 
-        // Put object in object store (complete upload in one call)
+        /**
+         * Put object in object store (complete upload in one call)
+         *
+         * @note Limitations vs. official NATS clients (nats.go, nats.js):
+         *  - SHA-256 digest is not computed (would require mbedtls SHA-256 on ESP32)
+         *  - Chunk subject is $O.<bucket>.C.<nuid> for all chunks (same as spec)
+         *  - Chunk ordering relies on JetStream sequence numbers
+         *  - Metadata format is compatible but does not include digest field
+         *  - For full cross-client compatibility, consider using obj_get_info()
+         *    to verify metadata before consuming objects written by this client
+         *
+         * @param bucket Bucket name
+         * @param name Object name
+         * @param data Object data
+         * @param data_len Data length in bytes
+         * @param description Optional description
+         * @param ack_cb Callback for metadata ACK
+         * @param on_timeout Timeout callback
+         * @param timeout_ms Timeout in milliseconds
+         * @return SID for metadata ACK subscription, or -1 on failure
+         */
         int obj_put(const char* bucket, const char* name, const uint8_t* data, size_t data_len,
                    const char* description, sub_cb ack_cb,
                    timeout_cb on_timeout = NULL, unsigned long timeout_ms = 5000) {
@@ -3365,6 +3385,14 @@ class NATS {
                 publish_binary(chunk_subject, data + chunk_offset, chunk_len);
             }
 
+            // Flush to ensure all chunks are sent before metadata
+            // This prevents metadata from arriving before chunk data
+            if (!flush(timeout_ms)) {
+                ESP_LOGE(tag, "Flush before metadata publish timed out - aborting to prevent corrupt object");
+                last_error_code = NATS_ERR_SOCKET_FAILED;
+                return -1;
+            }
+
             // Escape user-supplied strings to prevent JSON injection
             char escaped_name[256];
             if (json_escape(name, escaped_name, sizeof(escaped_name)) < 0) {
@@ -3383,23 +3411,37 @@ class NATS {
                 "{\"name\":\"%s\","
                 "\"size\":%zu,"
                 "\"chunks\":%llu,"
-                "\"nuid\":\"%s\"",
+                "\"nuid\":\"%s\","
+                "\"options\":{\"max_chunk_size\":%zu}",
                 escaped_name,
                 data_len,
                 (unsigned long long)num_chunks,
-                escaped_nuid
+                escaped_nuid,
+                CHUNK_SIZE
             );
+            if (len < 0 || (size_t)len >= sizeof(meta_payload)) {
+                ESP_LOGE(tag, "Object metadata too large for buffer");
+                return -1;
+            }
 
             if (description != NULL) {
                 char escaped_desc[256];
                 json_escape(description, escaped_desc, sizeof(escaped_desc));
                 len += snprintf(meta_payload + len, sizeof(meta_payload) - len,
                     ",\"description\":\"%s\"", escaped_desc);
+                if (len < 0 || (size_t)len >= sizeof(meta_payload)) {
+                    ESP_LOGE(tag, "Object metadata too large for buffer (after description)");
+                    return -1;
+                }
             }
 
             // Add timestamp
             len += snprintf(meta_payload + len, sizeof(meta_payload) - len,
                 ",\"mtime\":%llu}", (unsigned long long)(NATSUtil::millis() * 1000000ULL));
+            if (len < 0 || (size_t)len >= sizeof(meta_payload)) {
+                ESP_LOGE(tag, "Object metadata too large for buffer (after mtime)");
+                return -1;
+            }
 
             return jetstream_publish(meta_subject, meta_payload, ack_cb, on_timeout, timeout_ms, NULL);
         }
@@ -3436,22 +3478,38 @@ class NATS {
             return request_with_timeout(api_subject, payload, response_cb, timeout_ms, on_timeout);
         }
 
-        // Get object data (download)
-        int obj_get(const char* bucket, const char* name, sub_cb chunk_cb,
-                   timeout_cb on_timeout = NULL, unsigned long timeout_ms = 30000) {
-            if (bucket == NULL || name == NULL) return -1;
+        /**
+         * Watch for object chunk data in a bucket
+         *
+         * NOTE: This subscribes to ALL chunk subjects in the bucket.
+         * It does NOT download a specific object. For a full download,
+         * use obj_get_info() to get the NUID, then subscribe to
+         * $O.<bucket>.C.<nuid> and reassemble chunks by sequence.
+         *
+         * @param bucket Bucket name
+         * @param chunk_cb Callback for each chunk received
+         * @return Subscription ID, or -1 on failure
+         */
+        int obj_watch_chunks(const char* bucket, sub_cb chunk_cb) {
+            if (bucket == NULL) return -1;
             if (!connected) return -1;
-
-            // First get metadata to find NUID and chunk count
-            // In a real implementation, we'd parse the metadata response
-            // and then fetch each chunk. For this simplified version,
-            // we subscribe to the chunk pattern and let the callback handle assembly
 
             char chunk_subject[256];
             snprintf(chunk_subject, sizeof(chunk_subject), "$O.%s.C.>", bucket);
 
-            // Subscribe to get chunks (caller must handle chunk assembly)
             return subscribe(chunk_subject, chunk_cb, NULL, 0);
+        }
+
+        /**
+         * @deprecated Use obj_watch_chunks() instead. This function does not
+         * actually download an object - it subscribes to all chunk subjects.
+         */
+        int obj_get(const char* bucket, const char* name, sub_cb chunk_cb,
+                   timeout_cb on_timeout = NULL, unsigned long timeout_ms = 30000) {
+            (void)name;  // Not used - subscribes to all chunks
+            (void)on_timeout;
+            (void)timeout_ms;
+            return obj_watch_chunks(bucket, chunk_cb);
         }
 
         // List objects in bucket
