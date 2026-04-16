@@ -170,6 +170,13 @@ namespace NATSParsers {
         free(json_str);
         if (root == NULL) return false;
 
+        // Check for error response
+        cJSON* error_obj = cJSON_GetObjectItemCaseSensitive(root, "error");
+        if (error_obj != NULL) {
+            cJSON_Delete(root);
+            return false;
+        }
+
         cJSON* item;
         item = cJSON_GetObjectItemCaseSensitive(root, "name");
         if (cJSON_IsString(item)) meta->name = strdup(item->valuestring);
