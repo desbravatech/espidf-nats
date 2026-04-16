@@ -297,8 +297,8 @@ public:
         }
 
         // Send as text frame (NATS protocol is text-based)
-        // Use bounded timeout (10s) to prevent indefinite blocking
-        int ret = esp_websocket_client_send_text(client, data, len, pdMS_TO_TICKS(10000));
+        // Use configurable bounded timeout to prevent indefinite blocking
+        int ret = esp_websocket_client_send_text(client, data, len, pdMS_TO_TICKS(NATS_WEBSOCKET_SEND_TIMEOUT_MS));
         if (ret < 0) {
             ESP_LOGE(TAG, "WebSocket send failed: %d", ret);
             last_error = NATS_ERR_WEBSOCKET_SEND_FAILED;
@@ -582,10 +582,10 @@ private:
 
     void handle_data(esp_websocket_event_data_t* data) {
         if (data == NULL || rx_buffer == NULL) return;
-        // Only buffer text (1), binary (2), and continuation (0) frames
-        // Skip control frames (ping=9, pong=10, close=8)
-        if (data->op_code >= 8) {
-            ESP_LOGD(TAG, "Skipping control frame op_code=%d", data->op_code);
+        // Only buffer continuation (0), text (1), and binary (2) frames
+        // Skip reserved non-control opcodes (3-7) and control frames (8+)
+        if (!(data->op_code == 0 || data->op_code == 1 || data->op_code == 2)) {
+            ESP_LOGW(TAG, "Ignoring unsupported WebSocket frame op_code=%d", data->op_code);
             return;
         }
         if (data->data_len > 0 && data->data_ptr != NULL) {

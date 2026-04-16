@@ -74,6 +74,10 @@
 #define NATS_WEBSOCKET_RECONNECT_TIMEOUT 10000
 #endif
 
+#ifndef NATS_WEBSOCKET_SEND_TIMEOUT_MS
+#define NATS_WEBSOCKET_SEND_TIMEOUT_MS 10000
+#endif
+
 // Logging tag (inline to avoid ODR violations)
 inline const char* tag = "espidf-nats";
 
