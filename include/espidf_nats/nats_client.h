@@ -910,10 +910,16 @@ class NATS {
             // Include no_responders:true to get fast failure on request/reply with no subscribers
             if (user != NULL && pass != NULL) {
                 // Escape credentials to prevent JSON injection
-                char escaped_user[256];
-                char escaped_pass[256];
-                json_escape(user, escaped_user, sizeof(escaped_user));
-                json_escape(pass, escaped_pass, sizeof(escaped_pass));
+                char escaped_user[NATS_MAX_CREDENTIAL_LEN * 2 + 1];
+                char escaped_pass[NATS_MAX_CREDENTIAL_LEN * 2 + 1];
+                if (json_escape(user, escaped_user, sizeof(escaped_user)) < 0) {
+                    ESP_LOGE(tag, "Failed to escape username (too long)");
+                    return;
+                }
+                if (json_escape(pass, escaped_pass, sizeof(escaped_pass)) < 0) {
+                    ESP_LOGE(tag, "Failed to escape password (too long)");
+                    return;
+                }
                 send_fmt(
                         "CONNECT {"
                             "\"verbose\":%s,"
@@ -1197,11 +1203,17 @@ class NATS {
                     ESP_LOGI(tag, "Server requires TLS - already secured via transport (wss://)");
                 }
 
-                send_connect();
-                connected = true;
-                restore_subscriptions();
-                if (on_connect != NULL) on_connect();
-                send_pending_messages();
+                // Only perform handshake on first INFO (avoid duplicate CONNECT on async INFO updates)
+                if (!connected) {
+                    send_connect();
+                    connected = true;
+                    restore_subscriptions();
+                    if (on_connect != NULL) on_connect();
+                    send_pending_messages();
+                } else {
+                    // Already connected - just update server capabilities
+                    ESP_LOGD(tag, "Received async INFO update (already connected)");
+                }
                 free(buf);
                 return;
             }
@@ -2601,8 +2613,12 @@ class NATS {
             if (json == NULL) return -1;
 
             // Escape user-supplied strings to prevent JSON injection
-            char escaped_name[256];
-            json_escape(config->name, escaped_name, sizeof(escaped_name));
+            char escaped_name[NATS_MAX_SUBJECT_LEN * 2 + 1];
+            if (json_escape(config->name, escaped_name, sizeof(escaped_name)) < 0) {
+                ESP_LOGE(tag, "Failed to escape name (too long)");
+                free(json);
+                return -1;
+            }
 
             int offset = snprintf(json, json_size, "{\"name\":\"%s\",\"subjects\":[", escaped_name);
             if (offset >= (int)json_size) { free(json); return -1; }
@@ -2615,7 +2631,7 @@ class NATS {
                         offset += snprintf(json + offset, json_size - offset, ",");
                         if (offset >= (int)json_size) { free(json); return -1; }
                     }
-                    char escaped_subject[256];
+                    char escaped_subject[NATS_MAX_SUBJECT_LEN * 2 + 1];
                     json_escape(config->subjects[i], escaped_subject, sizeof(escaped_subject));
                     offset += snprintf(json + offset, json_size - offset, "\"%s\"", escaped_subject);
                     if (offset >= (int)json_size) { free(json); return -1; }
@@ -2706,7 +2722,11 @@ class NATS {
 
             // Escape user-supplied strings to prevent JSON injection
             char escaped_stream_name[256];
-            json_escape(config->stream_name, escaped_stream_name, sizeof(escaped_stream_name));
+            if (json_escape(config->stream_name, escaped_stream_name, sizeof(escaped_stream_name)) < 0) {
+                ESP_LOGE(tag, "Failed to escape stream name (too long)");
+                free(json);
+                return -1;
+            }
 
             // Start with stream_name and config wrapper
             int offset = snprintf(json, json_size, "{\"stream_name\":\"%s\",\"config\":{", escaped_stream_name);
@@ -2933,7 +2953,11 @@ class NATS {
 
             // Escape user-supplied strings to prevent JSON injection
             char escaped_bucket[256];
-            json_escape(config->bucket, escaped_bucket, sizeof(escaped_bucket));
+            if (json_escape(config->bucket, escaped_bucket, sizeof(escaped_bucket)) < 0) {
+                ESP_LOGE(tag, "Failed to escape bucket name (too long)");
+                free(json);
+                return -1;
+            }
 
             // Stream name is "KV_<bucket>" - DON'T close the object yet with ]}
             int offset = snprintf(json, json_size, "{\"name\":\"KV_%s\",\"subjects\":[\"$KV.%s.>\"]",
@@ -3171,7 +3195,10 @@ class NATS {
 
             // Escape user-supplied strings to prevent JSON injection
             char escaped_bucket[256];
-            json_escape(config->bucket, escaped_bucket, sizeof(escaped_bucket));
+            if (json_escape(config->bucket, escaped_bucket, sizeof(escaped_bucket)) < 0) {
+                ESP_LOGE(tag, "Failed to escape bucket name (too long)");
+                return -1;
+            }
             char escaped_storage[64];
             json_escape(config->storage ? config->storage : "file", escaped_storage, sizeof(escaped_storage));
 
@@ -3254,7 +3281,10 @@ class NATS {
 
             // Escape user-supplied strings to prevent JSON injection
             char escaped_name[256];
-            json_escape(name, escaped_name, sizeof(escaped_name));
+            if (json_escape(name, escaped_name, sizeof(escaped_name)) < 0) {
+                ESP_LOGE(tag, "Failed to escape object name (too long)");
+                return -1;
+            }
             char escaped_nuid[48];
             json_escape(nuid, escaped_nuid, sizeof(escaped_nuid));
 
@@ -3425,7 +3455,7 @@ class NATS {
             snprintf(api_subject, sizeof(api_subject), "$JS.API.DIRECT.GET.%s", stream_name);
 
             // Escape subject for JSON payload to prevent injection
-            char escaped_subject[256];
+            char escaped_subject[NATS_MAX_SUBJECT_LEN * 2 + 1];
             json_escape(subject, escaped_subject, sizeof(escaped_subject));
 
             char payload[256];
