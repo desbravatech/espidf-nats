@@ -2929,7 +2929,7 @@ class NATS {
             snprintf(json + offset, json_size - offset, "}");
 
             // JetStream API uses stream name in subject path
-            char api_subject[256];
+            char api_subject[1024];
             snprintf(api_subject, sizeof(api_subject), "$JS.API.STREAM.CREATE.%s", config->name);
 
             int sid = request_with_timeout(api_subject, json, response_cb, timeout_ms, on_timeout, 1);
@@ -2943,7 +2943,7 @@ class NATS {
             if (stream_name == NULL) return -1;
             if (!connected) return -1;
 
-            char api_subject[256];
+            char api_subject[1024];
             snprintf(api_subject, sizeof(api_subject), "$JS.API.STREAM.DELETE.%s", stream_name);
 
             return request_with_timeout(api_subject, "", response_cb, timeout_ms, on_timeout, 1);
@@ -2955,7 +2955,7 @@ class NATS {
             if (stream_name == NULL) return -1;
             if (!connected) return -1;
 
-            char api_subject[256];
+            char api_subject[1024];
             snprintf(api_subject, sizeof(api_subject), "$JS.API.STREAM.INFO.%s", stream_name);
 
             return request_with_timeout(api_subject, "", response_cb, timeout_ms, on_timeout, 1);
@@ -3033,7 +3033,7 @@ class NATS {
             // Use correct API endpoint based on consumer type (NATS 2.10+ format):
             // - Named (durable): $JS.API.CONSUMER.CREATE.<stream>.<consumer_name>
             // - Ephemeral: $JS.API.CONSUMER.CREATE.<stream>
-            char api_subject[512];
+            char api_subject[1024];
             if (config->durable_name != NULL) {
                 snprintf(api_subject, sizeof(api_subject), "$JS.API.CONSUMER.CREATE.%s.%s",
                         config->stream_name, config->durable_name);
@@ -3053,7 +3053,7 @@ class NATS {
             if (stream_name == NULL || consumer_name == NULL) return -1;
             if (!connected) return -1;
 
-            char api_subject[256];
+            char api_subject[1024];
             snprintf(api_subject, sizeof(api_subject), "$JS.API.CONSUMER.DELETE.%s.%s",
                     stream_name, consumer_name);
 
@@ -3077,7 +3077,7 @@ class NATS {
                 snprintf(json, sizeof(json), "{\"batch\":%d,\"expires\":%lld}", batch_size, expires_ns);
             }
 
-            char api_subject[256];
+            char api_subject[1024];
             snprintf(api_subject, sizeof(api_subject), "$JS.API.CONSUMER.MSG.NEXT.%s.%s",
                     stream_name, consumer_name);
 
@@ -3140,7 +3140,7 @@ class NATS {
 
             snprintf(json + offset, sizeof(json) - offset, "}");
 
-            char api_subject[256];
+            char api_subject[1024];
             snprintf(api_subject, sizeof(api_subject), "$JS.API.CONSUMER.MSG.NEXT.%s.%s",
                     stream_name, consumer_name);
 
@@ -3189,7 +3189,7 @@ class NATS {
             offset += snprintf(json + offset, json_size - offset, "}}");
             if (offset >= (int)json_size) { free(json); return -1; }
 
-            char api_subject[256];
+            char api_subject[1024];
             snprintf(api_subject, sizeof(api_subject), "$JS.API.CONSUMER.CREATE.%s", stream_name);
 
             int sid = request_with_timeout(api_subject, json, response_cb, timeout_ms, on_timeout, 1);
@@ -3271,7 +3271,7 @@ class NATS {
             if (offset >= (int)json_size) { free(json); return -1; }
 
             // Use correct API endpoint with stream name in subject
-            char api_subject[256];
+            char api_subject[1024];
             snprintf(api_subject, sizeof(api_subject), "$JS.API.STREAM.CREATE.KV_%s", config->bucket);
 
             int sid = request_with_timeout(api_subject, json, response_cb, timeout_ms, on_timeout, 1);
@@ -3299,10 +3299,10 @@ class NATS {
             int offset = snprintf(json, json_size, "{\"last_by_subj\":\"$KV.%s.%s\"}", escaped_bucket, escaped_key);
             if (offset >= (int)json_size) { free(json); return -1; }
 
-            char stream_name[512];
+            char stream_name[1024];
             snprintf(stream_name, sizeof(stream_name), "KV_%s", bucket);
 
-            char api_subject[512];
+            char api_subject[1024];
             int ret = snprintf(api_subject, sizeof(api_subject), "$JS.API.STREAM.MSG.GET.%s", stream_name);
             if (ret >= (int)sizeof(api_subject)) { free(json); return -1; }
 
@@ -3383,7 +3383,7 @@ class NATS {
             if (!connected) return -1;
 
             // Get stream info to list keys
-            char stream_name[256];
+            char stream_name[1024];
             snprintf(stream_name, sizeof(stream_name), "KV_%s", bucket);
 
             return jetstream_stream_info(stream_name, response_cb, on_timeout, timeout_ms);
@@ -3409,7 +3409,7 @@ class NATS {
             if (!connected) return -1;
 
             // Create a consumer to get all messages for this key
-            char stream_name[256];
+            char stream_name[1024];
             snprintf(stream_name, sizeof(stream_name), "KV_%s", bucket);
 
             char filter_subject[256];
@@ -3450,7 +3450,9 @@ class NATS {
             json_escape(config->storage ? config->storage : "file", escaped_storage, sizeof(escaped_storage));
 
             // Object store is a JetStream stream named OBJ_<bucket>
-            char stream_name[256];
+            // Buffer sized to hold prefix + max-length escaped bucket (which is
+            // already bounded at 256 by escaped_bucket above) without truncation.
+            char stream_name[1024];
             snprintf(stream_name, sizeof(stream_name), "OBJ_%s", escaped_bucket);
 
             // Build stream configuration JSON
@@ -3487,9 +3489,15 @@ class NATS {
 
             snprintf(payload + len, sizeof(payload) - len, "}");
 
-            // Use correct API endpoint with stream name in subject
-            char api_subject[512];
+            // Use correct API endpoint with stream name in subject.
+            // stream_name is bounded via preceding snprintf into a [1024] buffer
+            // with a 4-char prefix — practical max well under 1024 — but gcc's
+            // format-truncation heuristic can't prove it, so suppress locally.
+            char api_subject[1024];
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
             snprintf(api_subject, sizeof(api_subject), "$JS.API.STREAM.CREATE.%s", stream_name);
+#pragma GCC diagnostic pop
 
             return request_with_timeout(api_subject, payload, response_cb, timeout_ms, on_timeout);
         }
@@ -3538,7 +3546,7 @@ class NATS {
                 size_t chunk_len = (chunk_offset + CHUNK_SIZE > data_len) ?
                                    (data_len - chunk_offset) : CHUNK_SIZE;
 
-                char chunk_subject[256];
+                char chunk_subject[1024];
                 snprintf(chunk_subject, sizeof(chunk_subject),
                          "$O.%s.C.%s", bucket, nuid);
 
@@ -3564,7 +3572,7 @@ class NATS {
             json_escape(nuid, escaped_nuid, sizeof(escaped_nuid));
 
             // Publish metadata
-            char meta_subject[256];
+            char meta_subject[1024];
             snprintf(meta_subject, sizeof(meta_subject), "$O.%s.M.%s", bucket, name);
 
             char meta_payload[512];
@@ -3614,10 +3622,10 @@ class NATS {
             if (!connected) return -1;
 
             // Get the metadata message
-            char stream_name[256];
+            char stream_name[1024];
             snprintf(stream_name, sizeof(stream_name), "OBJ_%s", bucket);
 
-            char meta_subject[512];
+            char meta_subject[1024];
             int ret = snprintf(meta_subject, sizeof(meta_subject), "$O.%s.M.%s", bucket, name);
             if (ret >= (int)sizeof(meta_subject)) return -1;
 
@@ -3631,7 +3639,7 @@ class NATS {
                 "{\"last_by_subj\":\"%s\"}", escaped_meta_subject);
             if (ret >= (int)sizeof(payload)) return -1;
 
-            char api_subject[512];
+            char api_subject[1024];
             ret = snprintf(api_subject, sizeof(api_subject),
                      "$JS.API.STREAM.MSG.GET.%s", stream_name);
             if (ret >= (int)sizeof(api_subject)) return -1;
@@ -3655,7 +3663,7 @@ class NATS {
             if (bucket == NULL) return -1;
             if (!connected) return -1;
 
-            char chunk_subject[256];
+            char chunk_subject[1024];
             snprintf(chunk_subject, sizeof(chunk_subject), "$O.%s.C.>", bucket);
 
             return subscribe(chunk_subject, chunk_cb, NULL, 0);
@@ -3679,7 +3687,7 @@ class NATS {
             if (bucket == NULL) return -1;
             if (!connected) return -1;
 
-            char stream_name[256];
+            char stream_name[1024];
             snprintf(stream_name, sizeof(stream_name), "OBJ_%s", bucket);
 
             // Get stream info which includes metadata subjects
@@ -3693,7 +3701,7 @@ class NATS {
             if (!connected) return -1;
 
             // Delete metadata message (chunks will be purged by retention policy)
-            char meta_subject[256];
+            char meta_subject[1024];
             snprintf(meta_subject, sizeof(meta_subject), "$O.%s.M.%s", bucket, name);
 
             // Publish delete marker with headers
@@ -3750,7 +3758,7 @@ class NATS {
             if (stream_name == NULL || subject == NULL) return -1;
             if (!connected) return -1;
 
-            char api_subject[256];
+            char api_subject[1024];
             snprintf(api_subject, sizeof(api_subject), "$JS.API.DIRECT.GET.%s", stream_name);
 
             // Escape subject for JSON payload to prevent injection
