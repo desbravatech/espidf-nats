@@ -6,10 +6,12 @@ LDFLAGS = -lcjson
 
 all: test_utils test_parsers
 
-test_utils: test_utils.cpp esp_stubs.h
+FAKE_HEADERS = $(wildcard fake_esp_idf/*.h fake_esp_idf/**/*.h)
+
+test_utils: test_utils.cpp $(FAKE_HEADERS)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
 
-test_parsers: test_parsers.cpp esp_stubs.h
+test_parsers: test_parsers.cpp $(FAKE_HEADERS)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
 
 test: test_utils test_parsers
