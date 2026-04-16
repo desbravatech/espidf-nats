@@ -2184,6 +2184,7 @@ class NATS {
 
         void disconnect() {
             if (!connected && (transport == NULL || !transport->is_connected())) return;
+            last_reconnect_attempt = NATSUtil::millis();
             connected = false;
             connect_state = DISCONNECTED;
             async_connect_cb = NULL;
@@ -2229,8 +2230,6 @@ class NATS {
             disconnect();
 
             // Clean up subscriptions with mutex protection
-            // Note: We set elements to NULL but don't resize the array
-            // since NATSUtil::Array doesn't have a clear() method
             if (mutex != NULL) {
                 xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
                 for (size_t i = 0; i < subs.size(); i++) {
