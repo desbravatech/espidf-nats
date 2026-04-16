@@ -140,28 +140,49 @@ namespace NATSUtil {
                 len--;
             }
 
-            void empty() {
+            void clear() {
                 len = 0;
                 cap = 32;
                 free(data);
                 data = NULL;  // Set to NULL before malloc to avoid dangling pointer
                 data = (T*)malloc(cap * sizeof(T));
                 if (data == NULL) {
-                    ESP_LOGE("Array", "Failed to allocate array in empty()");
+                    ESP_LOGE("Array", "Failed to allocate array in clear()");
                     cap = 0;
                 }
             }
 
-            T const& operator[](size_t i) const { return data[i]; }
+            bool empty() const { return len == 0; }
+
+            T const& operator[](size_t i) const {
+                // Bounds check for const access (read-only)
+                if (data == NULL || i >= len) {
+                    ESP_LOGE("Array", "Out of bounds const access: index %zu, size %zu", i, len);
+                    // Return reference to static default to avoid crash
+                    static T default_val{};
+                    return default_val;
+                }
+                return data[i];
+            }
 
             T& operator[](size_t i) {
+                // For write access, grow if needed
                 while (i >= cap) resize();
+                // Extend len if writing beyond current size
+                if (i >= len) len = i + 1;
                 return data[i];
             }
 
             size_t push_back(T v) {
+                if (len >= cap) {
+                    resize();
+                    // Check if resize actually worked
+                    if (len >= cap) {
+                        ESP_LOGE("Array", "push_back failed: resize failed at capacity %zu", cap);
+                        return SIZE_MAX;  // Signal failure
+                    }
+                }
                 size_t i = len++;
-                if (len > cap) resize();
                 data[i] = v;
                 return i;
             }
@@ -212,20 +233,27 @@ namespace NATSUtil {
                 len++;
             }
 
-            T pop() {
+            // Safe pop - returns false if empty
+            bool pop(T& out) {
                 if (head == NULL) {
-                    // Should not happen if caller checks empty()
-                    return T();
+                    return false;
                 }
                 Node* oldHead = head;
-                T data = oldHead->data;
+                out = oldHead->data;
                 head = oldHead->next;
                 if (head == NULL) {
                     tail = NULL;
                 }
-                delete oldHead;  // Fix: Use delete for objects created with new
+                delete oldHead;
                 len--;
-                return data;
+                return true;
+            }
+
+            // Legacy pop - returns T() if empty (unsafe for types where T() is a valid value)
+            T pop() {
+                T result{};
+                pop(result);
+                return result;
             }
 
             T peek() {

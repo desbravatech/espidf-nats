@@ -2192,6 +2192,9 @@ class NATS {
                 last_error_code = NATS_ERR_DISCONNECTED;
             }
 
+            // Record disconnect time so first reconnect attempt respects backoff delay
+            last_reconnect_attempt = NATSUtil::millis();
+
             // Disconnect transport if using transport abstraction
             if (transport != NULL) {
                 transport->disconnect();
@@ -2229,8 +2232,6 @@ class NATS {
             disconnect();
 
             // Clean up subscriptions with mutex protection
-            // Note: We set elements to NULL but don't resize the array
-            // since NATSUtil::Array doesn't have a clear() method
             if (mutex != NULL) {
                 xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
                 for (size_t i = 0; i < subs.size(); i++) {
