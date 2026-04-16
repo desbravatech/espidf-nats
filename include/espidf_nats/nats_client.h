@@ -1715,6 +1715,80 @@ class NATS {
             }
         }
 
+        /**
+         * Internal subscription creation - all subscription creation goes through here
+         * Handles SID allocation, limit checking, and optional SUB command sending
+         *
+         * @param subject Subject to subscribe to
+         * @param cb Callback for messages
+         * @param queue Queue group (optional, NULL for none)
+         * @param max_wanted Maximum messages to receive (0 for unlimited)
+         * @param timeout_ms Timeout in milliseconds (0 for no timeout)
+         * @param on_timeout Timeout callback
+         * @param send_sub Whether to send SUB command to server (false for temporary inbox subs that don't need restore)
+         * @return SID on success, -1 on failure
+         */
+        int sub_internal(const char* subject, sub_cb cb, const char* queue = NULL,
+                         int max_wanted = 0, unsigned long timeout_ms = 0,
+                         timeout_cb on_timeout = NULL, bool send_sub = true) {
+            if (subject == NULL || cb == NULL) {
+                last_error_code = NATS_ERR_INVALID_ARG;
+                return -1;
+            }
+
+            // Validate subject (CR/LF injection check)
+            if (contains_crlf(subject) || contains_crlf(queue)) {
+                ESP_LOGE(tag, "Subject or queue contains CR/LF (protocol injection attempt)");
+                last_error_code = NATS_ERR_INVALID_ARG;
+                return -1;
+            }
+
+            xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
+
+            // Enforce subscription limit
+            size_t active_subs = subs.size() - free_sids.size();
+            if (active_subs >= NATS_MAX_SUBSCRIPTIONS) {
+                ESP_LOGE(tag, "Subscription limit reached: %zu (max %d)", active_subs, NATS_MAX_SUBSCRIPTIONS);
+                xSemaphoreGiveRecursive(mutex);
+                last_error_code = NATS_ERR_TOO_MANY_SUBS;
+                return -1;
+            }
+
+            // Create subscription with subject/queue for potential restore
+            // Only store subject if send_sub is true (persistent subs that need restore)
+            Sub* sub = new Sub(cb, max_wanted, timeout_ms, on_timeout,
+                               send_sub ? subject : NULL,
+                               send_sub ? queue : NULL);
+            if (sub == NULL) {
+                xSemaphoreGiveRecursive(mutex);
+                last_error_code = NATS_ERR_OUT_OF_MEMORY;
+                return -1;
+            }
+
+            int sid;
+            if (free_sids.empty()) {
+                sid = subs.push_back(sub);
+            } else {
+                sid = free_sids.pop();
+                subs[sid] = sub;
+            }
+
+            // Send SUB command to server if connected
+            if (connected && send_sub) {
+                if (queue != NULL && queue[0] != '\0') {
+                    send_fmt("SUB %s %s %d", subject, queue, sid);
+                } else {
+                    send_fmt("SUB %s %d", subject, sid);
+                }
+            } else if (connected) {
+                // For temporary subs (inboxes), still send SUB but don't store for restore
+                send_fmt("SUB %s %d", subject, sid);
+            }
+
+            xSemaphoreGiveRecursive(mutex);
+            return sid;
+        }
+
         void send_pending_messages() {
             // Process messages one at a time to avoid holding mutex during publish
             while (true) {
@@ -2447,47 +2521,16 @@ class NATS {
         }
 
         int subscribe(const char* subject, sub_cb cb, const char* queue = NULL, const int max_wanted = 0) {
-            if (!connected) return -1;
+            if (!connected) {
+                last_error_code = NATS_ERR_NOT_CONNECTED;
+                return -1;
+            }
             // Validate subject format (Issues #26, #41) - wildcards allowed in subscribe
-            if (!validate_subject_format(subject, true)) {  // true = wildcards allowed
+            if (!validate_subject_format(subject, true)) {
                 last_error_code = NATS_ERR_INVALID_SUBJECT;
                 return -1;
             }
-            // Prevent protocol injection via CR/LF in subject or queue
-            if (contains_crlf(subject) || contains_crlf(queue)) {
-                ESP_LOGE(tag, "Subject or queue contains CR/LF (protocol injection attempt)");
-                last_error_code = NATS_ERR_INVALID_ARG;
-                return -1;
-            }
-
-            xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
-
-            // Enforce subscription limit
-            size_t active_subs = subs.size() - free_sids.size();
-            if (active_subs >= NATS_MAX_SUBSCRIPTIONS) {
-                ESP_LOGE(tag, "Subscription limit reached: %zu (max %d)", active_subs, NATS_MAX_SUBSCRIPTIONS);
-                xSemaphoreGiveRecursive(mutex);
-                last_error_code = NATS_ERR_TOO_MANY_SUBS;
-                return -1;
-            }
-
-            // Store subject/queue for reconnection restoration (Issues #39, #55)
-            Sub* sub = new Sub(cb, max_wanted, 0, NULL, subject, queue);
-            int sid;
-            if (free_sids.empty()) {
-                sid = subs.push_back(sub);
-            } else {
-                sid = free_sids.pop();
-                subs[sid] = sub;
-            }
-            // SUB protocol: SUB <subject> [queue group] <sid>
-            if (queue != NULL && queue[0] != '\0') {
-                send_fmt("SUB %s %s %d", subject, queue, sid);
-            } else {
-                send_fmt("SUB %s %d", subject, sid);
-            }
-            xSemaphoreGiveRecursive(mutex);
-            return sid;
+            return sub_internal(subject, cb, queue, max_wanted, 0, NULL, true);
         }
 
         void unsubscribe(const int sid) {
@@ -2542,17 +2585,12 @@ class NATS {
                 return -1;
             }
 
-            xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
-            Sub* sub = new Sub(cb, max_wanted, timeout_ms, on_timeout);
-            int sid;
-            if (free_sids.empty()) {
-                sid = subs.push_back(sub);
-            } else {
-                sid = free_sids.pop();
-                subs[sid] = sub;
+            // Use sub_internal with send_sub=false (inbox doesn't need restore on reconnect)
+            int sid = sub_internal(inbox, cb, NULL, max_wanted, timeout_ms, on_timeout, false);
+            if (sid < 0) {
+                free(inbox);
+                return -1;
             }
-            send_fmt("SUB %s %d", inbox, sid);
-            xSemaphoreGiveRecursive(mutex);
 
             publish(subject, msg, inbox);
             free(inbox);
@@ -2568,31 +2606,21 @@ class NATS {
             if (subject == NULL || subject[0] == 0) return -1;
             if (!connected) return -1;
 
-            // Generate inbox for receiving the JetStream ACK
             char* inbox = generate_inbox_subject();
             if (inbox == NULL) return -1;
 
-            // Subscribe to inbox first to receive ACK
-            xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
-            Sub* sub = new Sub(ack_cb, 1, timeout_ms, on_timeout);
-            int sid;
-            if (free_sids.empty()) {
-                sid = subs.push_back(sub);
-            } else {
-                sid = free_sids.pop();
-                subs[sid] = sub;
+            // Use sub_internal for inbox subscription
+            int sid = sub_internal(inbox, ack_cb, NULL, 1, timeout_ms, on_timeout, false);
+            if (sid < 0) {
+                free(inbox);
+                return -1;
             }
-            send_fmt("SUB %s %d", inbox, sid);
-            xSemaphoreGiveRecursive(mutex);
 
             if (msg_id != NULL) {
-                // Use headers for message deduplication
                 char headers[256];
                 snprintf(headers, sizeof(headers), "NATS/1.0\r\nNats-Msg-Id: %s\r\n\r\n", msg_id);
-                // Publish directly to subject (not an API endpoint) with reply-to inbox
                 publish_with_headers(subject, headers, msg, inbox);
             } else {
-                // Publish directly to subject with reply-to inbox for ACK
                 publish(subject, msg, inbox);
             }
 
@@ -3079,17 +3107,11 @@ class NATS {
             char* inbox = generate_inbox_subject();
             if (inbox == NULL) return -1;
 
-            xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
-            Sub* sub = new Sub(ack_cb, 1, timeout_ms, on_timeout);
-            int sid;
-            if (free_sids.empty()) {
-                sid = subs.push_back(sub);
-            } else {
-                sid = free_sids.pop();
-                subs[sid] = sub;
+            int sid = sub_internal(inbox, ack_cb, NULL, 1, timeout_ms, on_timeout, false);
+            if (sid < 0) {
+                free(inbox);
+                return -1;
             }
-            send_fmt("SUB %s %d", inbox, sid);
-            xSemaphoreGiveRecursive(mutex);
 
             publish_with_headers(subject, headers, "", inbox);
             free(inbox);
@@ -3111,17 +3133,11 @@ class NATS {
             char* inbox = generate_inbox_subject();
             if (inbox == NULL) return -1;
 
-            xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
-            Sub* sub = new Sub(ack_cb, 1, timeout_ms, on_timeout);
-            int sid;
-            if (free_sids.empty()) {
-                sid = subs.push_back(sub);
-            } else {
-                sid = free_sids.pop();
-                subs[sid] = sub;
+            int sid = sub_internal(inbox, ack_cb, NULL, 1, timeout_ms, on_timeout, false);
+            if (sid < 0) {
+                free(inbox);
+                return -1;
             }
-            send_fmt("SUB %s %d", inbox, sid);
-            xSemaphoreGiveRecursive(mutex);
 
             publish_with_headers(subject, headers, "", inbox);
             free(inbox);
@@ -3396,17 +3412,11 @@ class NATS {
             char* inbox = generate_inbox_subject();
             if (inbox == NULL) return -1;
 
-            xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
-            Sub* sub = new Sub(ack_cb, 1, timeout_ms, on_timeout);
-            int sid;
-            if (free_sids.empty()) {
-                sid = subs.push_back(sub);
-            } else {
-                sid = free_sids.pop();
-                subs[sid] = sub;
+            int sid = sub_internal(inbox, ack_cb, NULL, 1, timeout_ms, on_timeout, false);
+            if (sid < 0) {
+                free(inbox);
+                return -1;
             }
-            send_fmt("SUB %s %d", inbox, sid);
-            xSemaphoreGiveRecursive(mutex);
 
             publish_with_headers(meta_subject, headers, "", inbox);
             free(inbox);
