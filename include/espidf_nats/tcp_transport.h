@@ -20,9 +20,12 @@
 #include <unistd.h>
 #include <esp_log.h>
 #include <esp_tls.h>
+#include <mbedtls/build_info.h>
 #include <mbedtls/ssl.h>
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
+#endif
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/error.h>
 #include <mbedtls/net_sockets.h>
@@ -52,8 +55,10 @@ private:
     mbedtls_ssl_context* mbedtls_ssl;
     mbedtls_ssl_config* mbedtls_conf;
     mbedtls_x509_crt* mbedtls_cacert;
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
     mbedtls_entropy_context* mbedtls_entropy;
     mbedtls_ctr_drbg_context* mbedtls_ctr_drbg;
+#endif
     bool using_mbedtls_directly;
 
     nats_tls_config_t tls_config;
@@ -72,8 +77,10 @@ public:
         mbedtls_ssl(NULL),
         mbedtls_conf(NULL),
         mbedtls_cacert(NULL),
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
         mbedtls_entropy(NULL),
         mbedtls_ctr_drbg(NULL),
+#endif
         using_mbedtls_directly(false),
         state(TRANSPORT_DISCONNECTED),
         last_error(NATS_ERR_NONE),
@@ -183,10 +190,14 @@ public:
         if (io_mutex != NULL) xSemaphoreTakeRecursive(io_mutex, portMAX_DELAY);
 
         if (using_mbedtls_directly && mbedtls_ssl != NULL) {
-            // STARTTLS mode
+            // STARTTLS mode; handle WANT_READ/WANT_WRITE per mbedtls docs
             size_t total_sent = 0;
             while (total_sent < len) {
                 ret = mbedtls_ssl_write(mbedtls_ssl, (const unsigned char*)(data + total_sent), len - total_sent);
+                if (NATS_TLS_IS_RETRYABLE(ret)) {
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                    continue;
+                }
                 if (ret <= 0) {
                     ESP_LOGE(TAG, "mbedtls write failed: %d", (int)ret);
                     last_error = NATS_ERR_SOCKET_FAILED;
@@ -201,6 +212,10 @@ public:
             size_t total_sent = 0;
             while (total_sent < len) {
                 ret = esp_tls_conn_write(tls, data + total_sent, len - total_sent);
+                if (NATS_TLS_IS_RETRYABLE(ret)) {
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                    continue;
+                }
                 if (ret <= 0) {
                     ESP_LOGE(TAG, "TLS write failed: %d", (int)ret);
                     last_error = NATS_ERR_SOCKET_FAILED;
@@ -293,6 +308,13 @@ public:
                 ret = ::recv(sockfd, &c, 1, 0);
             }
 
+            // mbedtls 1.3 may emit WANT_READ/WANT_WRITE mid-stream (post-handshake
+            // NewSessionTicket etc.); retry instead of tearing down the connection.
+            if (NATS_TLS_IS_RETRYABLE(ret)) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+
             if (ret <= 0) {
                 if (ret < 0) {
                     ESP_LOGE(TAG, "Read error: %d", ret);
@@ -374,6 +396,11 @@ public:
                 ret = ::recv(sockfd, buf + total_read, to_read, 0);
             }
 
+            if (NATS_TLS_IS_RETRYABLE(ret)) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+
             if (ret <= 0) {
                 if (ret < 0) {
                     ESP_LOGE(TAG, "Read error: %d", ret);
@@ -410,6 +437,11 @@ public:
                 ret = esp_tls_conn_read(tls, discard, to_read);
             } else {
                 ret = ::recv(sockfd, discard, to_read, 0);
+            }
+
+            if (NATS_TLS_IS_RETRYABLE(ret)) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
             }
 
             if (ret <= 0) {
@@ -508,10 +540,16 @@ public:
         mbedtls_ssl = (mbedtls_ssl_context*)malloc(sizeof(mbedtls_ssl_context));
         mbedtls_conf = (mbedtls_ssl_config*)malloc(sizeof(mbedtls_ssl_config));
         mbedtls_cacert = (mbedtls_x509_crt*)malloc(sizeof(mbedtls_x509_crt));
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
         mbedtls_entropy = (mbedtls_entropy_context*)malloc(sizeof(mbedtls_entropy_context));
         mbedtls_ctr_drbg = (mbedtls_ctr_drbg_context*)malloc(sizeof(mbedtls_ctr_drbg_context));
+#endif
 
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
         if (!mbedtls_ssl || !mbedtls_conf || !mbedtls_cacert || !mbedtls_entropy || !mbedtls_ctr_drbg) {
+#else
+        if (!mbedtls_ssl || !mbedtls_conf || !mbedtls_cacert) {
+#endif
             ESP_LOGE(TAG, "Failed to allocate mbedtls contexts");
             cleanup_mbedtls();
             last_error = NATS_ERR_OUT_OF_MEMORY;
@@ -522,10 +560,11 @@ public:
         mbedtls_ssl_init(mbedtls_ssl);
         mbedtls_ssl_config_init(mbedtls_conf);
         mbedtls_x509_crt_init(mbedtls_cacert);
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
         mbedtls_entropy_init(mbedtls_entropy);
         mbedtls_ctr_drbg_init(mbedtls_ctr_drbg);
 
-        // Seed the random number generator
+        // Seed the random number generator (mbedtls 3.x only; 4.x uses PSA Crypto RNG)
         ret = mbedtls_ctr_drbg_seed(mbedtls_ctr_drbg, mbedtls_entropy_func, mbedtls_entropy,
                                     (const unsigned char*)"nats_tls", 8);
         if (ret != 0) {
@@ -535,6 +574,7 @@ public:
             last_error = NATS_ERR_TLS_INIT_FAILED;
             return false;
         }
+#endif
 
         // Parse CA certificate or use certificate bundle
         bool ca_configured = false;
@@ -588,7 +628,10 @@ public:
             mbedtls_ssl_conf_authmode(mbedtls_conf, MBEDTLS_SSL_VERIFY_NONE);
         }
 
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
+        // mbedtls 3.x requires explicit RNG wiring; 4.x uses PSA Crypto internally
         mbedtls_ssl_conf_rng(mbedtls_conf, mbedtls_ctr_drbg_random, mbedtls_ctr_drbg);
+#endif
 
         // Set up SSL context
         ret = mbedtls_ssl_setup(mbedtls_ssl, mbedtls_conf);
@@ -687,6 +730,7 @@ private:
             free(mbedtls_cacert);
             mbedtls_cacert = NULL;
         }
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
         if (mbedtls_ctr_drbg) {
             mbedtls_ctr_drbg_free(mbedtls_ctr_drbg);
             free(mbedtls_ctr_drbg);
@@ -697,6 +741,7 @@ private:
             free(mbedtls_entropy);
             mbedtls_entropy = NULL;
         }
+#endif
         using_mbedtls_directly = false;
     }
 

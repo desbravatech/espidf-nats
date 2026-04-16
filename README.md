@@ -33,12 +33,25 @@ An ESP-IDF and FreeRTOS compatible C++ library for communicating with a [NATS](h
 - **Exponential backoff** - Smart reconnection delays (1s, 2s, 4s, 8s, 16s, 30s max)
 - **Flush and drain** - Graceful shutdown with pending message delivery guarantees
 
+## Compatibility
+
+| Platform | Versions supported |
+|----------|--------------------|
+| ESP-IDF  | 4.4 – 6.0 |
+| mbedtls  | 3.x and 4.x (PSA Crypto) |
+| TLS      | 1.2 and 1.3 (including post-handshake `NewSessionTicket` under mbedtls 4.x) |
+| Targets  | ESP32, ESP32-S2/S3, ESP32-C3/C6, ESP32-H2, ESP32-P4 (any ESP-IDF-supported chip) |
+
+Notes:
+- ESP-IDF v6.0 ships mbedtls 4.0 with PSA Crypto. The library detects this via `MBEDTLS_VERSION_NUMBER` and compiles out the legacy entropy/ctr_drbg/`mbedtls_ssl_conf_rng` plumbing automatically — no consumer action needed.
+- TLS 1.3 requires `CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=y` in your `sdkconfig` (off by default in ESP-IDF v6.0).
+
 ### Installation
 
 **Via ESP-IDF Component Registry (recommended):**
 
 ```bash
-idf.py add-dependency "debsahu/espidf-nats^1.3.0"
+idf.py add-dependency "debsahu/espidf-nats^1.4.0"
 ```
 
 **Or clone the repository as an ESP-IDF component:**
@@ -1196,3 +1209,21 @@ Common configuration options can be customized by defining them before including
 #define NATS_MAX_PENDING_MESSAGES 100            // Max buffered messages
 #include "espidf_nats.h"
 ```
+
+## Version History
+
+### 1.4.0
+- **ESP-IDF v6.0 / mbedtls 4.0 compatibility.** Legacy entropy/ctr_drbg setup and `mbedtls_ssl_conf_rng()` are now version-gated via `MBEDTLS_VERSION_NUMBER`. Under mbedtls 4.x the PSA Crypto RNG is used transparently; 3.x builds are unchanged.
+- **TLS 1.3 post-handshake handling.** All TLS read/write sites now retry on `MBEDTLS_ERR_SSL_WANT_READ`, `MBEDTLS_ERR_SSL_WANT_WRITE`, and `MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET` instead of disconnecting. Fixes silent drops after TLS 1.3 handshake completes when the server emits a `NewSessionTicket`.
+- Verified end-to-end on ESP-IDF v6.0 + mbedtls 4.0 on real hardware (ESP32-C6) against `nats-server` with both TLS 1.2 and TLS 1.3.
+
+### 1.3.0
+- **JetStream**: streams, consumers, pull-based delivery, ACK/NAK/delayed-ACK, message deduplication via `Nats-Msg-Id` header.
+- **Key-Value Store**: bucket management, put/get/delete/purge, watchers, history, key listing.
+- **Object Store**: automatic 128 KB chunking, put/get/list/delete/watch.
+- **Ordered Consumers**, **Fetch Operations**, **Direct Get**, **Consumer Pause**, **Account Info**.
+- **WebSocket transport** (`ws://` and `wss://`) via `esp_websocket_client`, with multi-server failover.
+- **NKey and JWT authentication**.
+- **ESP-IDF v6.0 cjson migration** (cjson moved from built-in to registry component).
+- **STARTTLS reconnect fix**: guard against upgrading an already-TLS connection.
+- Format-truncation build fixes.

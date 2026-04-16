@@ -14,9 +14,12 @@
 #include <cJSON.h>
 #include <esp_log.h>
 #include <esp_tls.h>
+#include <mbedtls/build_info.h>
 #include <mbedtls/ssl.h>
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
+#endif
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/error.h>
 #include <mbedtls/net_sockets.h>
@@ -78,8 +81,10 @@ class NATS {
         mbedtls_ssl_context* mbedtls_ssl;
         mbedtls_ssl_config* mbedtls_conf;
         mbedtls_x509_crt* mbedtls_cacert;
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
         mbedtls_entropy_context* mbedtls_entropy;
         mbedtls_ctr_drbg_context* mbedtls_ctr_drbg;
+#endif
         bool using_mbedtls_directly;  // true when using mbedtls directly (STARTTLS)
         nats_tls_config_t tls_config;
         NATSUtil::Array<nats_server_t> servers;
@@ -154,8 +159,10 @@ class NATS {
             mbedtls_ssl(NULL),
             mbedtls_conf(NULL),
             mbedtls_cacert(NULL),
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
             mbedtls_entropy(NULL),
             mbedtls_ctr_drbg(NULL),
+#endif
             using_mbedtls_directly(false),
             current_server_idx(0),
             user(user),
@@ -256,8 +263,10 @@ class NATS {
             mbedtls_ssl(NULL),
             mbedtls_conf(NULL),
             mbedtls_cacert(NULL),
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
             mbedtls_entropy(NULL),
             mbedtls_ctr_drbg(NULL),
+#endif
             using_mbedtls_directly(false),
             current_server_idx(0),
             user(user),
@@ -719,19 +728,44 @@ class NATS {
             if (io_mutex != NULL) xSemaphoreTakeRecursive(io_mutex, portMAX_DELAY);
 
             if (using_mbedtls_directly && mbedtls_ssl != NULL) {
-                // Use mbedtls directly (STARTTLS mode)
-                ret = mbedtls_ssl_write(mbedtls_ssl, (const unsigned char*)data, len);
-                if (ret < 0 || (size_t)ret != len) {
-                    ESP_LOGE(tag, "mbedtls write failed: %d", (int)ret);
-                    last_error_code = NATS_ERR_SOCKET_FAILED;
-                    success = false;
+                // Use mbedtls directly (STARTTLS mode).
+                // Per mbedtls docs, ssl_write may return short or WANT_READ/WANT_WRITE
+                // (esp. under TLS 1.3 when post-handshake messages must be processed).
+                // Loop until all bytes are sent or a fatal error occurs.
+                size_t total_sent = 0;
+                ret = 0;
+                while (total_sent < len) {
+                    ret = mbedtls_ssl_write(mbedtls_ssl,
+                                            (const unsigned char*)data + total_sent,
+                                            len - total_sent);
+                    if (NATS_TLS_IS_RETRYABLE(ret)) {
+                        vTaskDelay(pdMS_TO_TICKS(10));
+                        continue;
+                    }
+                    if (ret < 0) {
+                        ESP_LOGE(tag, "mbedtls write failed: %d", (int)ret);
+                        last_error_code = NATS_ERR_SOCKET_FAILED;
+                        success = false;
+                        break;
+                    }
+                    total_sent += (size_t)ret;
                 }
             } else if (tls_config.enabled && tls != NULL) {
-                ret = esp_tls_conn_write(tls, data, len);
-                if (ret < 0 || (size_t)ret != len) {
-                    ESP_LOGE(tag, "TLS write failed: %d", (int)ret);
-                    last_error_code = NATS_ERR_SOCKET_FAILED;
-                    success = false;
+                size_t total_sent = 0;
+                ret = 0;
+                while (total_sent < len) {
+                    ret = esp_tls_conn_write(tls, (const char*)data + total_sent, len - total_sent);
+                    if (NATS_TLS_IS_RETRYABLE(ret)) {
+                        vTaskDelay(pdMS_TO_TICKS(10));
+                        continue;
+                    }
+                    if (ret < 0) {
+                        ESP_LOGE(tag, "TLS write failed: %d", (int)ret);
+                        last_error_code = NATS_ERR_SOCKET_FAILED;
+                        success = false;
+                        break;
+                    }
+                    total_sent += (size_t)ret;
                 }
             } else {
                 if (sockfd < 0) {
@@ -779,15 +813,43 @@ class NATS {
             // Protect TLS/socket I/O operations with io_mutex
             if (io_mutex != NULL) xSemaphoreTakeRecursive(io_mutex, portMAX_DELAY);
 
+            // mbedtls/esp-tls writes may return short or WANT_READ/WANT_WRITE
+            // (esp. under TLS 1.3). Loop until all bytes flushed.
+            auto write_all_mbedtls = [this](const unsigned char* p, size_t n) -> int {
+                size_t sent = 0;
+                while (sent < n) {
+                    int r = mbedtls_ssl_write(mbedtls_ssl, p + sent, n - sent);
+                    if (NATS_TLS_IS_RETRYABLE(r)) {
+                        vTaskDelay(pdMS_TO_TICKS(10));
+                        continue;
+                    }
+                    if (r < 0) return r;
+                    sent += (size_t)r;
+                }
+                return (int)sent;
+            };
+            auto write_all_esp_tls = [this](const char* p, size_t n) -> int {
+                size_t sent = 0;
+                while (sent < n) {
+                    int r = esp_tls_conn_write(tls, p + sent, n - sent);
+                    if (NATS_TLS_IS_RETRYABLE(r)) {
+                        vTaskDelay(pdMS_TO_TICKS(10));
+                        continue;
+                    }
+                    if (r < 0) return r;
+                    sent += (size_t)r;
+                }
+                return (int)sent;
+            };
+
             if (using_mbedtls_directly && mbedtls_ssl != NULL) {
-                // Use mbedtls directly (STARTTLS mode)
-                ret = mbedtls_ssl_write(mbedtls_ssl, (const unsigned char*)msg, len);
-                if (ret < 0 || (size_t)ret != len) {
+                ret = write_all_mbedtls((const unsigned char*)msg, len);
+                if (ret < 0) {
                     ESP_LOGE(tag, "mbedtls write failed: %d", (int)ret);
                     last_error_code = NATS_ERR_SOCKET_FAILED;
                     need_disconnect = true;
                 } else {
-                    ret = mbedtls_ssl_write(mbedtls_ssl, (const unsigned char*)NATS_CR_LF, strlen(NATS_CR_LF));
+                    ret = write_all_mbedtls((const unsigned char*)NATS_CR_LF, strlen(NATS_CR_LF));
                     if (ret < 0) {
                         ESP_LOGE(tag, "mbedtls write CRLF failed: %d", (int)ret);
                         last_error_code = NATS_ERR_SOCKET_FAILED;
@@ -795,17 +857,17 @@ class NATS {
                     }
                 }
             } else if (tls_config.enabled && tls != NULL) {
-                ret = esp_tls_conn_write(tls, msg, len);
-                if (ret < 0 || (size_t)ret != len) {
+                ret = write_all_esp_tls(msg, len);
+                if (ret < 0) {
                     ESP_LOGE(tag, "TLS write failed: %d", (int)ret);
                     last_error_code = NATS_ERR_SOCKET_FAILED;
-                    need_disconnect = true;  // Set flag instead of calling disconnect()
+                    need_disconnect = true;
                 } else {
-                    ret = esp_tls_conn_write(tls, NATS_CR_LF, strlen(NATS_CR_LF));
+                    ret = write_all_esp_tls(NATS_CR_LF, strlen(NATS_CR_LF));
                     if (ret < 0) {
                         ESP_LOGE(tag, "TLS write CRLF failed: %d", (int)ret);
                         last_error_code = NATS_ERR_SOCKET_FAILED;
-                        need_disconnect = true;  // Set flag instead of calling disconnect()
+                        need_disconnect = true;
                     }
                 }
             } else {
@@ -849,10 +911,14 @@ class NATS {
             if (io_mutex != NULL) xSemaphoreTakeRecursive(io_mutex, portMAX_DELAY);
 
             if (using_mbedtls_directly && mbedtls_ssl != NULL) {
-                // Use mbedtls directly (STARTTLS mode)
+                // Use mbedtls directly (STARTTLS mode); handle WANT_READ/WANT_WRITE
                 size_t total_sent = 0;
                 while (total_sent < len) {
                     ret = mbedtls_ssl_write(mbedtls_ssl, data + total_sent, len - total_sent);
+                    if (NATS_TLS_IS_RETRYABLE(ret)) {
+                        vTaskDelay(pdMS_TO_TICKS(10));
+                        continue;
+                    }
                     if (ret <= 0) {
                         ESP_LOGE(tag, "mbedtls write failed: %d", (int)ret);
                         last_error_code = NATS_ERR_SOCKET_FAILED;
@@ -862,7 +928,14 @@ class NATS {
                     total_sent += ret;
                 }
                 if (!need_disconnect) {
-                    ret = mbedtls_ssl_write(mbedtls_ssl, (const unsigned char*)NATS_CR_LF, 2);
+                    do {
+                        ret = mbedtls_ssl_write(mbedtls_ssl, (const unsigned char*)NATS_CR_LF, 2);
+                        if (NATS_TLS_IS_RETRYABLE(ret)) {
+                            vTaskDelay(pdMS_TO_TICKS(10));
+                            continue;
+                        }
+                        break;
+                    } while (true);
                     if (ret < 0) {
                         ESP_LOGE(tag, "mbedtls write CRLF failed: %d", (int)ret);
                         last_error_code = NATS_ERR_SOCKET_FAILED;
@@ -873,6 +946,10 @@ class NATS {
                 size_t total_sent = 0;
                 while (total_sent < len) {
                     ret = esp_tls_conn_write(tls, data + total_sent, len - total_sent);
+                    if (NATS_TLS_IS_RETRYABLE(ret)) {
+                        vTaskDelay(pdMS_TO_TICKS(10));
+                        continue;
+                    }
                     if (ret <= 0) {
                         ESP_LOGE(tag, "TLS write failed: %d", (int)ret);
                         last_error_code = NATS_ERR_SOCKET_FAILED;
@@ -882,7 +959,14 @@ class NATS {
                     total_sent += ret;
                 }
                 if (!need_disconnect) {
-                    ret = esp_tls_conn_write(tls, NATS_CR_LF, 2);
+                    do {
+                        ret = esp_tls_conn_write(tls, NATS_CR_LF, 2);
+                        if (NATS_TLS_IS_RETRYABLE(ret)) {
+                            vTaskDelay(pdMS_TO_TICKS(10));
+                            continue;
+                        }
+                        break;
+                    } while (true);
                     if (ret < 0) {
                         ESP_LOGE(tag, "TLS write CRLF failed: %d", (int)ret);
                         last_error_code = NATS_ERR_SOCKET_FAILED;
@@ -1180,6 +1264,13 @@ class NATS {
                     ret = ::recv(sockfd, buf + total_read, to_read, 0);
                 }
 
+                // mbedtls 1.3 may emit WANT_READ/WANT_WRITE mid-stream (post-handshake
+                // NewSessionTicket etc.); retry instead of tearing down the connection.
+                if (NATS_TLS_IS_RETRYABLE(ret)) {
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                    continue;
+                }
+
                 if (ret <= 0) {
                     if (ret < 0) {
                         ESP_LOGE(tag, "Read error: %d", ret);
@@ -1227,6 +1318,11 @@ class NATS {
                     ret = esp_tls_conn_read(tls, discard, to_read);
                 } else {
                     ret = ::recv(sockfd, discard, to_read, 0);
+                }
+
+                if (NATS_TLS_IS_RETRYABLE(ret)) {
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                    continue;
                 }
 
                 if (ret <= 0) {
@@ -1282,6 +1378,10 @@ class NATS {
                     ret = esp_tls_conn_read(tls, &c, 1);
                 } else {
                     ret = ::recv(sockfd, &c, 1, 0);
+                }
+                if (NATS_TLS_IS_RETRYABLE(ret)) {
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                    continue;
                 }
                 if (ret <= 0) {
                     // Connection closed (0) or error (-1)
@@ -2081,6 +2181,7 @@ class NATS {
                 free(mbedtls_cacert);
                 mbedtls_cacert = NULL;
             }
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
             if (mbedtls_ctr_drbg) {
                 mbedtls_ctr_drbg_free(mbedtls_ctr_drbg);
                 free(mbedtls_ctr_drbg);
@@ -2091,6 +2192,7 @@ class NATS {
                 free(mbedtls_entropy);
                 mbedtls_entropy = NULL;
             }
+#endif
             using_mbedtls_directly = false;
         }
 
@@ -2110,10 +2212,16 @@ class NATS {
             mbedtls_ssl = (mbedtls_ssl_context*)malloc(sizeof(mbedtls_ssl_context));
             mbedtls_conf = (mbedtls_ssl_config*)malloc(sizeof(mbedtls_ssl_config));
             mbedtls_cacert = (mbedtls_x509_crt*)malloc(sizeof(mbedtls_x509_crt));
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
             mbedtls_entropy = (mbedtls_entropy_context*)malloc(sizeof(mbedtls_entropy_context));
             mbedtls_ctr_drbg = (mbedtls_ctr_drbg_context*)malloc(sizeof(mbedtls_ctr_drbg_context));
+#endif
 
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
             if (!mbedtls_ssl || !mbedtls_conf || !mbedtls_cacert || !mbedtls_entropy || !mbedtls_ctr_drbg) {
+#else
+            if (!mbedtls_ssl || !mbedtls_conf || !mbedtls_cacert) {
+#endif
                 ESP_LOGE(tag, "Failed to allocate mbedtls contexts");
                 cleanup_mbedtls();
                 last_error_code = NATS_ERR_OUT_OF_MEMORY;
@@ -2124,10 +2232,11 @@ class NATS {
             mbedtls_ssl_init(mbedtls_ssl);
             mbedtls_ssl_config_init(mbedtls_conf);
             mbedtls_x509_crt_init(mbedtls_cacert);
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
             mbedtls_entropy_init(mbedtls_entropy);
             mbedtls_ctr_drbg_init(mbedtls_ctr_drbg);
 
-            // Seed the random number generator
+            // Seed the random number generator (mbedtls 3.x only; 4.x uses PSA Crypto RNG)
             ret = mbedtls_ctr_drbg_seed(mbedtls_ctr_drbg, mbedtls_entropy_func, mbedtls_entropy,
                                         (const unsigned char*)"nats_tls", 8);
             if (ret != 0) {
@@ -2137,6 +2246,7 @@ class NATS {
                 last_error_code = NATS_ERR_TLS_INIT_FAILED;
                 return false;
             }
+#endif
 
             // Parse CA certificate
             if (tls_config.ca_cert != NULL && tls_config.ca_cert_len > 0) {
@@ -2177,7 +2287,10 @@ class NATS {
                 mbedtls_ssl_conf_authmode(mbedtls_conf, MBEDTLS_SSL_VERIFY_NONE);
             }
 
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
+            // mbedtls 3.x requires explicit RNG wiring; 4.x uses PSA Crypto internally
             mbedtls_ssl_conf_rng(mbedtls_conf, mbedtls_ctr_drbg_random, mbedtls_ctr_drbg);
+#endif
 
             // Set up SSL context
             ret = mbedtls_ssl_setup(mbedtls_ssl, mbedtls_conf);

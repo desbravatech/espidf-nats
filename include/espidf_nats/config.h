@@ -3,7 +3,19 @@
 
 // NATS client identification
 #define NATS_CLIENT_LANG "espidf"
-#define NATS_CLIENT_VERSION "1.3.0"
+#define NATS_CLIENT_VERSION "1.4.0"
+
+// TLS retry-able mbedtls return codes. Hardcoded to stable mbedtls error values
+// because this macro is sometimes expanded before <mbedtls/ssl.h> has populated
+// the symbolic names (config.h is pulled in via the umbrella header first).
+//   -0x6900 = MBEDTLS_ERR_SSL_WANT_READ                       (3.x and 4.x)
+//   -0x6880 = MBEDTLS_ERR_SSL_WANT_WRITE                      (3.x and 4.x)
+//   -0x7B00 = MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET     (4.x only — TLS 1.3
+//             post-handshake NewSessionTicket; callers must retry the read.)
+// On mbedtls 3.x the third value is unused and never returned, so the check is
+// harmless. Keeping the canonical names in comments for grep-ability.
+#define NATS_TLS_IS_RETRYABLE(r) \
+    ((r) == -0x6900 || (r) == -0x6880 || (r) == -0x7B00)
 
 // Configuration options (can be overridden before including)
 #ifndef NATS_CONF_VERBOSE
