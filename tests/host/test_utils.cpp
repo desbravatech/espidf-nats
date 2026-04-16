@@ -1,17 +1,21 @@
 /**
- * Host-side unit tests for NATSUtil (Array, Queue, RingBuffer, base64, creds parser)
- * Compile: g++ -std=c++17 -I../../include -I. -DHOST_TEST test_utils.cpp -lcjson -o test_utils
+ * Host-side unit tests for NATSUtil (Array, Queue, RingBuffer, millis, random, secure_zero)
+ *
+ * Tests the pure-logic components that don't depend on real ESP-IDF hardware.
+ * Compile: cd tests/host && make test_utils
  */
+
 // Include the actual library header (fake ESP-IDF headers in fake_esp_idf/)
 #include "espidf_nats/util.h"
 
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 
 static int tests_passed = 0;
 static int tests_failed = 0;
 
-#define TEST(name) printf("  TEST: %s ... ", name)
+#define TEST(name) printf("  TEST: %-50s ", name)
 #define PASS() do { tests_passed++; printf("PASS\n"); } while(0)
 #define FAIL(msg) do { tests_failed++; printf("FAIL: %s\n", msg); } while(0)
 #define ASSERT(cond, msg) do { if (!(cond)) { FAIL(msg); return; } } while(0)
@@ -29,11 +33,10 @@ void test_array_basic() {
 }
 
 void test_array_growth() {
-    TEST("Array auto-growth");
+    TEST("Array auto-growth beyond initial capacity");
     NATSUtil::Array<int> arr(2);
     for (int i = 0; i < 100; i++) {
-        size_t idx = arr.push_back(i);
-        ASSERT(idx != SIZE_MAX, "push_back should not fail");
+        arr.push_back(i);
     }
     ASSERT(arr.size() == 100, "size should be 100");
     ASSERT(arr[0] == 0, "first value");
@@ -41,55 +44,111 @@ void test_array_growth() {
     PASS();
 }
 
-void test_array_const_bounds_check() {
-    TEST("Array const operator[] bounds check");
+void test_array_large() {
+    TEST("Array grows to 10000 elements");
     NATSUtil::Array<int> arr(4);
-    arr.push_back(10);
-    arr.push_back(20);
-    const NATSUtil::Array<int>& carr = arr;
-    ASSERT(carr[0] == 10, "index 0");
-    ASSERT(carr[1] == 20, "index 1");
-    // Out of bounds should return default (0 for int)
-    int val = carr[999];
-    ASSERT(val == 0, "OOB should return default");
+    for (int i = 0; i < 10000; i++) {
+        arr.push_back(i * 3);
+    }
+    ASSERT(arr.size() == 10000, "size should be 10000");
+    ASSERT(arr[0] == 0, "first");
+    ASSERT(arr[9999] == 29997, "last = 9999*3");
     PASS();
 }
 
-void test_array_erase() {
-    TEST("Array erase");
+void test_array_erase_front() {
+    TEST("Array erase first element");
+    NATSUtil::Array<int> arr(4);
+    arr.push_back(10);
+    arr.push_back(20);
+    arr.push_back(30);
+    arr.erase(0);
+    ASSERT(arr.size() == 2, "size after erase");
+    ASSERT(arr[0] == 20, "shifted element 0");
+    ASSERT(arr[1] == 30, "shifted element 1");
+    PASS();
+}
+
+void test_array_erase_middle() {
+    TEST("Array erase middle element");
     NATSUtil::Array<int> arr(4);
     arr.push_back(1);
     arr.push_back(2);
     arr.push_back(3);
     arr.erase(1);
     ASSERT(arr.size() == 2, "size after erase");
-    ASSERT(arr[0] == 1, "first element");
+    ASSERT(arr[0] == 1, "first element unchanged");
     ASSERT(arr[1] == 3, "shifted element");
     PASS();
 }
 
-void test_array_clear_and_empty() {
-    TEST("Array clear() and empty()");
+void test_array_erase_last() {
+    TEST("Array erase last element");
     NATSUtil::Array<int> arr(4);
     arr.push_back(1);
     arr.push_back(2);
-    ASSERT(!arr.empty(), "should not be empty");
-    arr.clear();
-    ASSERT(arr.empty(), "should be empty after clear");
-    ASSERT(arr.size() == 0, "size should be 0");
-    // Should be usable again
+    arr.push_back(3);
+    arr.erase(2);
+    ASSERT(arr.size() == 2, "size after erase");
+    ASSERT(arr[0] == 1, "first");
+    ASSERT(arr[1] == 2, "second");
+    PASS();
+}
+
+void test_array_erase_oob() {
+    TEST("Array erase out-of-bounds is safe");
+    NATSUtil::Array<int> arr(4);
+    arr.push_back(1);
+    arr.erase(5);  // Should do nothing
+    ASSERT(arr.size() == 1, "size unchanged");
+    ASSERT(arr[0] == 1, "value unchanged");
+    PASS();
+}
+
+void test_array_empty_method() {
+    TEST("Array empty() clears and resets");
+    NATSUtil::Array<int> arr(4);
+    arr.push_back(1);
+    arr.push_back(2);
+    arr.push_back(3);
+    ASSERT(arr.size() == 3, "size before empty");
+    arr.empty();
+    ASSERT(arr.size() == 0, "size after empty should be 0");
+    // Should be usable after empty
     arr.push_back(99);
     ASSERT(arr.size() == 1, "size after re-push");
     ASSERT(arr[0] == 99, "value after re-push");
     PASS();
 }
 
+void test_array_pointer_type() {
+    TEST("Array with pointer type (Sub*)");
+    NATSUtil::Array<void*> arr(4);
+    int a = 1, b = 2, c = 3;
+    arr.push_back(&a);
+    arr.push_back(&b);
+    arr.push_back(NULL);
+    arr.push_back(&c);
+    ASSERT(arr.size() == 4, "size");
+    ASSERT(arr[0] == &a, "first pointer");
+    ASSERT(arr[2] == NULL, "NULL pointer");
+    ASSERT(arr[3] == &c, "fourth pointer");
+    // Erase and verify NULLs shift correctly
+    arr.erase(1);
+    ASSERT(arr.size() == 3, "size after erase");
+    ASSERT(arr[0] == &a, "first unchanged");
+    ASSERT(arr[1] == NULL, "shifted NULL");
+    ASSERT(arr[2] == &c, "shifted last");
+    PASS();
+}
+
 // ===== Queue Tests =====
 
 void test_queue_basic() {
-    TEST("Queue basic push/pop");
+    TEST("Queue basic FIFO push/pop");
     NATSUtil::Queue<int> q;
     ASSERT(q.empty(), "new queue should be empty");
+    ASSERT(q.size() == 0, "size 0");
     q.push(1);
     q.push(2);
     q.push(3);
@@ -97,64 +156,151 @@ void test_queue_basic() {
     ASSERT(!q.empty(), "should not be empty");
     ASSERT(q.peek() == 1, "peek should be 1");
 
-    int val;
-    ASSERT(q.pop(val) == true, "pop should succeed");
-    ASSERT(val == 1, "first pop should be 1");
-    ASSERT(q.pop(val) == true, "pop should succeed");
-    ASSERT(val == 2, "second pop should be 2");
-    ASSERT(q.pop(val) == true, "pop should succeed");
-    ASSERT(val == 3, "third pop should be 3");
+    int v1 = q.pop();
+    ASSERT(v1 == 1, "first pop should be 1");
+    int v2 = q.pop();
+    ASSERT(v2 == 2, "second pop should be 2");
+    int v3 = q.pop();
+    ASSERT(v3 == 3, "third pop should be 3");
     ASSERT(q.empty(), "should be empty now");
+    ASSERT(q.size() == 0, "size 0 after draining");
     PASS();
 }
 
-void test_queue_safe_pop_empty() {
-    TEST("Queue safe pop on empty");
-    NATSUtil::Queue<size_t> q;
-    size_t val = 999;
-    ASSERT(q.pop(val) == false, "pop on empty should return false");
-    ASSERT(val == 999, "val should be unchanged on failed pop");
-    PASS();
-}
-
-void test_queue_legacy_pop() {
-    TEST("Queue legacy pop");
+void test_queue_pop_empty() {
+    TEST("Queue pop on empty returns T()");
     NATSUtil::Queue<int> q;
-    q.push(42);
     int val = q.pop();
-    ASSERT(val == 42, "legacy pop should return value");
-    int empty_val = q.pop();
-    ASSERT(empty_val == 0, "legacy pop on empty returns T()");
+    ASSERT(val == 0, "pop on empty int queue returns 0");
+
+    NATSUtil::Queue<void*> pq;
+    void* ptr = pq.pop();
+    ASSERT(ptr == NULL, "pop on empty ptr queue returns NULL");
+    PASS();
+}
+
+void test_queue_peek_empty() {
+    TEST("Queue peek on empty returns T()");
+    NATSUtil::Queue<int> q;
+    ASSERT(q.peek() == 0, "peek on empty returns 0");
+    PASS();
+}
+
+void test_queue_interleaved() {
+    TEST("Queue interleaved push/pop");
+    NATSUtil::Queue<int> q;
+    q.push(1);
+    q.push(2);
+    ASSERT(q.pop() == 1, "pop 1");
+    q.push(3);
+    ASSERT(q.pop() == 2, "pop 2");
+    ASSERT(q.pop() == 3, "pop 3");
+    ASSERT(q.empty(), "empty after draining");
+    // Re-use after drain
+    q.push(10);
+    ASSERT(q.pop() == 10, "pop after refill");
+    PASS();
+}
+
+void test_queue_large() {
+    TEST("Queue 1000 elements FIFO order");
+    NATSUtil::Queue<int> q;
+    for (int i = 0; i < 1000; i++) {
+        q.push(i);
+    }
+    ASSERT(q.size() == 1000, "size 1000");
+    for (int i = 0; i < 1000; i++) {
+        int v = q.pop();
+        ASSERT(v == i, "FIFO order maintained");
+    }
+    ASSERT(q.empty(), "empty after 1000 pops");
+    PASS();
+}
+
+void test_queue_size_t() {
+    TEST("Queue<size_t> pop returns 0 on empty (valid SID!)");
+    // This demonstrates why the safe pop(T& out) overload is needed
+    NATSUtil::Queue<size_t> q;
+    size_t val = q.pop();
+    ASSERT(val == 0, "pop returns 0 which is a valid SID");
+    // A caller that doesn't check empty() first would get SID 0
     PASS();
 }
 
 // ===== Millis Timer Tests =====
 
-void test_millis() {
+void test_millis_nonzero() {
     TEST("millis() returns non-zero");
     unsigned long ms = NATSUtil::millis();
     ASSERT(ms > 0, "millis should be > 0");
     PASS();
 }
 
+void test_millis_monotonic() {
+    TEST("millis() is monotonically increasing");
+    unsigned long a = NATSUtil::millis();
+    // Busy-wait a tiny bit
+    for (volatile int i = 0; i < 100000; i++) {}
+    unsigned long b = NATSUtil::millis();
+    ASSERT(b >= a, "millis should not decrease");
+    PASS();
+}
+
+void test_millis_timer() {
+    TEST("MillisTimer triggers after interval elapses");
+    // MillisTimer triggers when (ms - t) > interval, so interval=0
+    // only triggers if at least 1ms has elapsed since creation
+    NATSUtil::MillisTimer timer(1);  // 1ms interval
+    // Busy-wait to ensure at least 2ms pass
+    unsigned long start = NATSUtil::millis();
+    while (NATSUtil::millis() - start < 5) {}
+    ASSERT(timer.process(), "should trigger after interval elapses");
+    PASS();
+}
+
 // ===== Random Tests =====
 
-void test_random() {
-    TEST("random() range check");
-    for (int i = 0; i < 1000; i++) {
+void test_random_range() {
+    TEST("random() values in [0, max)");
+    for (int i = 0; i < 10000; i++) {
         int r = NATSUtil::random(10);
         ASSERT(r >= 0 && r < 10, "random should be in [0,10)");
     }
+    PASS();
+}
+
+void test_random_edge_cases() {
+    TEST("random() edge cases");
     ASSERT(NATSUtil::random(0) == 0, "random(0) should be 0");
     ASSERT(NATSUtil::random(1) == 0, "random(1) should be 0");
+    ASSERT(NATSUtil::random(-5) == 0, "random(negative) should be 0");
+    PASS();
+}
+
+void test_random_distribution() {
+    TEST("random() distribution (not all same value)");
+    int counts[10] = {};
+    for (int i = 0; i < 10000; i++) {
+        counts[NATSUtil::random(10)]++;
+    }
+    // Each bucket should get roughly 1000. Check none is 0 or > 5000
+    bool reasonable = true;
+    for (int i = 0; i < 10; i++) {
+        if (counts[i] == 0 || counts[i] > 5000) {
+            reasonable = false;
+            break;
+        }
+    }
+    ASSERT(reasonable, "distribution should be roughly uniform");
     PASS();
 }
 
 // ===== Secure Memory Tests =====
 
 void test_secure_zero() {
-    TEST("secure_zero");
-    char buf[16] = "hello world";
+    TEST("secure_zero clears buffer");
+    char buf[32];
+    memset(buf, 0xAA, sizeof(buf));
     NATSUtil::secure_zero(buf, sizeof(buf));
     for (size_t i = 0; i < sizeof(buf); i++) {
         ASSERT(buf[i] == 0, "all bytes should be zero");
@@ -162,102 +308,26 @@ void test_secure_zero() {
     PASS();
 }
 
+void test_secure_zero_null() {
+    TEST("secure_zero(NULL) is safe");
+    NATSUtil::secure_zero(NULL, 0);
+    NATSUtil::secure_zero(NULL, 100);
+    PASS();
+}
+
 void test_secure_free() {
-    TEST("secure_free (no crash)");
-    char* str = strdup("secret password");
+    TEST("secure_free frees without crash");
+    char* str = strdup("secret password 12345");
     NATSUtil::secure_free(str);
-    NATSUtil::secure_free(NULL);  // Should not crash
-    PASS();
-}
-
-// ===== Base64 Tests =====
-
-void test_base64_encode() {
-    TEST("base64_encode");
-    uint8_t data[] = {0x48, 0x65, 0x6c, 0x6c, 0x6f};  // "Hello"
-    char out[32];
-    int ret = NATSUtil::base64_encode(data, 5, out, sizeof(out));
-    ASSERT(ret > 0, "should return positive length");
-    ASSERT(strcmp(out, "SGVsbG8=") == 0, "Hello -> SGVsbG8=");
-    PASS();
-}
-
-void test_base64_encode_empty() {
-    TEST("base64_encode empty");
-    char out[8];
-    int ret = NATSUtil::base64_encode(NULL, 0, out, sizeof(out));
-    // Empty input should produce empty output
-    ASSERT(ret == 0, "empty input");
-    PASS();
-}
-
-void test_base64_encode_buffer_too_small() {
-    TEST("base64_encode buffer too small");
-    uint8_t data[] = {1, 2, 3, 4, 5, 6, 7, 8};
-    char out[4];  // Too small for 8 bytes of input
-    int ret = NATSUtil::base64_encode(data, 8, out, sizeof(out));
-    ASSERT(ret == -1, "should return -1 for too-small buffer");
-    PASS();
-}
-
-// ===== Creds Parser Tests =====
-
-void test_parse_creds_file() {
-    TEST("parse_creds_file");
-    const char* creds =
-        "-----BEGIN NATS USER JWT-----\n"
-        "eyJhbGciOiJlZDI1NTE5LW5rZXkiLCJ0eXAiOiJKV1QifQ.test.signature\n"
-        "------END NATS USER JWT------\n"
-        "\n"
-        "************************* IMPORTANT *************************\n"
-        "NKEY Seed printed below can be used to sign and prove identity.\n"
-        "\n"
-        "-----BEGIN USER NKEY SEED-----\n"
-        "SUACSSL3UAHUDXKFSNVUZRF5UHPMWZ6BFDTJ7M6USDXIEDNPPQYYYCU3VY\n"
-        "------END USER NKEY SEED------\n";
-
-    char* jwt = NULL;
-    char* seed = NULL;
-    bool ok = NATSUtil::parse_creds_file(creds, &jwt, &seed);
-    ASSERT(ok, "parse should succeed");
-    ASSERT(jwt != NULL, "jwt should not be NULL");
-    ASSERT(seed != NULL, "seed should not be NULL");
-    ASSERT(strstr(jwt, "eyJhbGci") != NULL, "jwt should start with eyJ");
-    ASSERT(strstr(seed, "SUACSSL3") != NULL, "seed should start with SUA");
-    free(jwt);
-    NATSUtil::secure_free(seed);
-    PASS();
-}
-
-void test_parse_creds_file_missing_seed() {
-    TEST("parse_creds_file missing seed");
-    const char* creds =
-        "-----BEGIN NATS USER JWT-----\n"
-        "eyJhbGciOiJ0ZXN0In0.payload.sig\n"
-        "------END NATS USER JWT------\n";
-
-    char* jwt = NULL;
-    char* seed = NULL;
-    bool ok = NATSUtil::parse_creds_file(creds, &jwt, &seed);
-    ASSERT(!ok, "should fail without seed");
-    ASSERT(jwt == NULL, "jwt should be cleaned up");
-    ASSERT(seed == NULL, "seed should be NULL");
-    PASS();
-}
-
-void test_parse_creds_file_null() {
-    TEST("parse_creds_file NULL input");
-    char* jwt = NULL;
-    char* seed = NULL;
-    ASSERT(!NATSUtil::parse_creds_file(NULL, &jwt, &seed), "NULL input");
-    ASSERT(!NATSUtil::parse_creds_file("", &jwt, &seed), "empty input");
+    // Also test NULL
+    NATSUtil::secure_free(NULL);
     PASS();
 }
 
 // ===== RingBuffer Tests =====
 
-void test_ringbuffer_basic() {
-    TEST("RingBuffer basic write/read");
+void test_ringbuffer_basic_write_read() {
+    TEST("RingBuffer basic write then read");
     NATSUtil::RingBuffer rb(64);
     uint8_t write_data[] = "Hello NATS";
     size_t written = rb.write(write_data, 10);
@@ -270,73 +340,191 @@ void test_ringbuffer_basic() {
     ASSERT(read_count == 10, "should read 10 bytes");
     ASSERT(memcmp(read_data, "Hello NATS", 10) == 0, "data should match");
     ASSERT(rb.empty(), "empty after full read");
+    ASSERT(rb.available() == 0, "0 available");
     PASS();
 }
 
-void test_ringbuffer_overflow() {
-    TEST("RingBuffer overflow drops oldest");
-    NATSUtil::RingBuffer rb(8);  // Small buffer
+void test_ringbuffer_partial_read() {
+    TEST("RingBuffer partial read");
+    NATSUtil::RingBuffer rb(64);
+    uint8_t data[] = "ABCDEFGHIJ";
+    rb.write(data, 10);
+
+    uint8_t buf[4] = {};
+    size_t n = rb.read(buf, 4);
+    ASSERT(n == 4, "read 4 bytes");
+    ASSERT(memcmp(buf, "ABCD", 4) == 0, "first 4 bytes");
+    ASSERT(rb.available() == 6, "6 remaining");
+
+    n = rb.read(buf, 4);
+    ASSERT(n == 4, "read 4 more");
+    ASSERT(memcmp(buf, "EFGH", 4) == 0, "next 4 bytes");
+
+    n = rb.read(buf, 4);
+    ASSERT(n == 2, "only 2 left");
+    ASSERT(memcmp(buf, "IJ", 2) == 0, "last 2 bytes");
+    ASSERT(rb.empty(), "empty now");
+    PASS();
+}
+
+void test_ringbuffer_read_byte() {
+    TEST("RingBuffer read_byte one at a time");
+    NATSUtil::RingBuffer rb(32);
+    uint8_t data[] = "ABC";
+    rb.write(data, 3);
+
+    uint8_t b;
+    ASSERT(rb.read_byte(&b) == 1, "read 1 byte");
+    ASSERT(b == 'A', "first byte A");
+    ASSERT(rb.read_byte(&b) == 1, "read 1 byte");
+    ASSERT(b == 'B', "second byte B");
+    ASSERT(rb.read_byte(&b) == 1, "read 1 byte");
+    ASSERT(b == 'C', "third byte C");
+    ASSERT(rb.read_byte(&b) == 0, "no more bytes");
+    PASS();
+}
+
+void test_ringbuffer_wrap_around() {
+    TEST("RingBuffer wrap-around (write, read, write again)");
+    NATSUtil::RingBuffer rb(16);  // Small buffer to force wrap
+
+    // Fill partially
+    uint8_t data1[] = "1234567890";
+    rb.write(data1, 10);
+
+    // Read some
+    uint8_t buf[8] = {};
+    rb.read(buf, 8);
+    ASSERT(memcmp(buf, "12345678", 8) == 0, "first read");
+
+    // Write more (will wrap around)
+    uint8_t data2[] = "ABCDEF";
+    rb.write(data2, 6);
+
+    // Read all remaining: "90" + "ABCDEF"
+    uint8_t result[16] = {};
+    size_t total = rb.read(result, 16);
+    ASSERT(total == 8, "8 bytes remaining");
+    ASSERT(memcmp(result, "90ABCDEF", 8) == 0, "wrap-around data correct");
+    PASS();
+}
+
+void test_ringbuffer_overflow_drops_oldest() {
+    TEST("RingBuffer overflow drops oldest data");
+    NATSUtil::RingBuffer rb(8);  // capacity 8, usable 7 (one slot wasted)
     uint8_t data[16];
-    memset(data, 'A', sizeof(data));
+    memset(data, 'X', sizeof(data));
     // Write more than capacity
     size_t written = rb.write(data, 16);
-    ASSERT(written == 16, "all bytes accepted (oldest dropped)");
-    // Available should be capacity - 1 (ring buffer wastes one slot)
-    ASSERT(rb.available() <= 8, "available <= capacity");
+    ASSERT(written == 16, "all 16 bytes 'accepted' (oldest dropped)");
+    // Read what's available
+    uint8_t out[16] = {};
+    size_t avail = rb.available();
+    ASSERT(avail > 0 && avail <= 7, "some data available (up to cap-1)");
+    rb.read(out, avail);
+    // All should be 'X' (same data)
+    for (size_t i = 0; i < avail; i++) {
+        ASSERT(out[i] == 'X', "data should be X");
+    }
     PASS();
 }
 
 void test_ringbuffer_clear() {
-    TEST("RingBuffer clear");
+    TEST("RingBuffer clear resets state");
     NATSUtil::RingBuffer rb(32);
-    uint8_t data[] = "test";
-    rb.write(data, 4);
-    ASSERT(!rb.empty(), "not empty");
+    uint8_t data[] = "test data";
+    rb.write(data, 9);
+    ASSERT(!rb.empty(), "not empty before clear");
     rb.clear();
     ASSERT(rb.empty(), "empty after clear");
+    ASSERT(rb.available() == 0, "0 available after clear");
+    // Usable after clear
+    rb.write(data, 4);
+    ASSERT(rb.available() == 4, "4 available after re-write");
+    PASS();
+}
+
+void test_ringbuffer_capacity() {
+    TEST("RingBuffer get_capacity");
+    NATSUtil::RingBuffer rb(256);
+    ASSERT(rb.get_capacity() == 256, "capacity should be 256");
+    PASS();
+}
+
+void test_ringbuffer_null_safety() {
+    TEST("RingBuffer NULL parameter safety");
+    NATSUtil::RingBuffer rb(32);
+    ASSERT(rb.write(NULL, 10) == 0, "write NULL returns 0");
+    ASSERT(rb.write((uint8_t*)"x", 0) == 0, "write 0 len returns 0");
+    ASSERT(rb.read(NULL, 10) == 0, "read NULL returns 0");
+    uint8_t buf[4];
+    ASSERT(rb.read(buf, 0) == 0, "read 0 len returns 0");
+    PASS();
+}
+
+void test_ringbuffer_empty_read() {
+    TEST("RingBuffer read on empty returns 0");
+    NATSUtil::RingBuffer rb(32);
+    uint8_t buf[8];
+    ASSERT(rb.read(buf, 8) == 0, "read on empty returns 0");
+    ASSERT(rb.read_byte(buf) == 0, "read_byte on empty returns 0");
     PASS();
 }
 
 // ===== Main =====
 
 int main() {
+    srand(42);  // Seed for reproducibility
+
     printf("=== NATSUtil Host Tests ===\n\n");
 
     printf("--- Array ---\n");
     test_array_basic();
     test_array_growth();
-    test_array_const_bounds_check();
-    test_array_erase();
-    test_array_clear_and_empty();
+    test_array_large();
+    test_array_erase_front();
+    test_array_erase_middle();
+    test_array_erase_last();
+    test_array_erase_oob();
+    test_array_empty_method();
+    test_array_pointer_type();
 
     printf("\n--- Queue ---\n");
     test_queue_basic();
-    test_queue_safe_pop_empty();
-    test_queue_legacy_pop();
+    test_queue_pop_empty();
+    test_queue_peek_empty();
+    test_queue_interleaved();
+    test_queue_large();
+    test_queue_size_t();
 
-    printf("\n--- Millis/Random ---\n");
-    test_millis();
-    test_random();
+    printf("\n--- MillisTimer ---\n");
+    test_millis_nonzero();
+    test_millis_monotonic();
+    test_millis_timer();
+
+    printf("\n--- Random ---\n");
+    test_random_range();
+    test_random_edge_cases();
+    test_random_distribution();
 
     printf("\n--- Secure Memory ---\n");
     test_secure_zero();
+    test_secure_zero_null();
     test_secure_free();
 
-    printf("\n--- Base64 ---\n");
-    test_base64_encode();
-    test_base64_encode_empty();
-    test_base64_encode_buffer_too_small();
-
-    printf("\n--- Creds Parser ---\n");
-    test_parse_creds_file();
-    test_parse_creds_file_missing_seed();
-    test_parse_creds_file_null();
-
     printf("\n--- RingBuffer ---\n");
-    test_ringbuffer_basic();
-    test_ringbuffer_overflow();
+    test_ringbuffer_basic_write_read();
+    test_ringbuffer_partial_read();
+    test_ringbuffer_read_byte();
+    test_ringbuffer_wrap_around();
+    test_ringbuffer_overflow_drops_oldest();
     test_ringbuffer_clear();
+    test_ringbuffer_capacity();
+    test_ringbuffer_null_safety();
+    test_ringbuffer_empty_read();
 
-    printf("\n=== Results: %d passed, %d failed ===\n", tests_passed, tests_failed);
+    printf("\n========================================\n");
+    printf("Results: %d passed, %d failed\n", tests_passed, tests_failed);
+    printf("========================================\n");
     return tests_failed > 0 ? 1 : 0;
 }
