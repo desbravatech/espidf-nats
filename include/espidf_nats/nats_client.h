@@ -3227,8 +3227,10 @@ class NATS {
 
             // Flush to ensure all chunks are sent before metadata
             // This prevents metadata from arriving before chunk data
-            if (!flush(5000)) {
-                ESP_LOGW(tag, "Flush before metadata publish timed out - chunks may be incomplete");
+            if (!flush(timeout_ms)) {
+                ESP_LOGE(tag, "Flush before metadata publish timed out - aborting to prevent corrupt object");
+                last_error_code = NATS_ERR_SOCKET_FAILED;
+                return -1;
             }
 
             // Publish metadata
@@ -3248,15 +3250,27 @@ class NATS {
                 nuid,
                 CHUNK_SIZE
             );
+            if (len < 0 || (size_t)len >= sizeof(meta_payload)) {
+                ESP_LOGE(tag, "Object metadata too large for buffer");
+                return -1;
+            }
 
             if (description != NULL) {
                 len += snprintf(meta_payload + len, sizeof(meta_payload) - len,
                     ",\"description\":\"%s\"", description);
+                if (len < 0 || (size_t)len >= sizeof(meta_payload)) {
+                    ESP_LOGE(tag, "Object metadata too large for buffer (after description)");
+                    return -1;
+                }
             }
 
             // Add timestamp
             len += snprintf(meta_payload + len, sizeof(meta_payload) - len,
                 ",\"mtime\":%llu}", (unsigned long long)(NATSUtil::millis() * 1000000ULL));
+            if (len < 0 || (size_t)len >= sizeof(meta_payload)) {
+                ESP_LOGE(tag, "Object metadata too large for buffer (after mtime)");
+                return -1;
+            }
 
             return jetstream_publish(meta_subject, meta_payload, ack_cb, on_timeout, timeout_ms, NULL);
         }
