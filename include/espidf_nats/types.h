@@ -238,4 +238,42 @@ typedef struct {
     uint64_t nuid;                     // Unique operation ID
 } object_store_status_t;
 
+/**
+ * NATS authentication method
+ */
+typedef enum {
+    NATS_AUTH_NONE = 0,            // No authentication
+    NATS_AUTH_USER_PASS,           // Username/password
+    NATS_AUTH_TOKEN,               // Authentication token
+    NATS_AUTH_NKEY,                // NKey (ed25519 seed + optional JWT)
+    NATS_AUTH_CREDENTIALS          // .creds file (JWT + NKey seed)
+} nats_auth_method_t;
+
+/**
+ * NKey signing callback
+ * Called during CONNECT to sign the server's nonce
+ *
+ * @param nonce The server's challenge nonce (from INFO)
+ * @param nonce_len Length of nonce
+ * @param signature Output buffer for ed25519 signature (64 bytes)
+ * @param sig_len Output: actual signature length (should be 64)
+ * @param seed The NKey seed (ed25519 private key, starts with 'S')
+ * @return true on success, false on failure
+ */
+typedef bool (*nats_nkey_sign_fn)(const uint8_t* nonce, size_t nonce_len,
+                                   uint8_t* signature, size_t* sig_len,
+                                   const char* seed);
+
+/**
+ * NATS authentication configuration
+ */
+typedef struct {
+    nats_auth_method_t method;     // Authentication method
+    const char* token;             // Auth token (NATS_AUTH_TOKEN)
+    const char* jwt;               // User JWT (NATS_AUTH_NKEY or NATS_AUTH_CREDENTIALS)
+    const char* nkey_seed;         // NKey seed (NATS_AUTH_NKEY or NATS_AUTH_CREDENTIALS)
+    const char* nkey_public;       // NKey public key (optional, for verification)
+    nats_nkey_sign_fn sign_fn;     // NKey signing function (required for NATS_AUTH_NKEY)
+} nats_auth_config_t;
+
 #endif // ESPIDF_NATS_TYPES_H
