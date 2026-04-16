@@ -100,6 +100,7 @@ class NATS {
         SemaphoreHandle_t mutex;          // Protects data structures (subs, pending_messages)
         SemaphoreHandle_t io_mutex;       // Protects TLS/socket I/O operations
         SemaphoreHandle_t state_mutex;    // Protects outstanding_pings and reconnect_attempts
+        SemaphoreHandle_t recv_mutex;     // Protects recv() from concurrent access
 
     public:
         bool connected;
@@ -155,6 +156,7 @@ class NATS {
             last_reconnect_attempt(0),
             connect_state(DISCONNECTED),
             async_connect_cb(NULL),
+            last_error_code(NATS_ERR_NONE),
             connected(false),
             max_outstanding_pings(3),
             max_reconnect_attempts(-1),
@@ -195,13 +197,15 @@ class NATS {
                 mutex = xSemaphoreCreateRecursiveMutex();
                 io_mutex = xSemaphoreCreateRecursiveMutex();
                 state_mutex = xSemaphoreCreateRecursiveMutex();
-                if (mutex == NULL || io_mutex == NULL || state_mutex == NULL) {
+                recv_mutex = xSemaphoreCreateRecursiveMutex();
+                if (mutex == NULL || io_mutex == NULL || state_mutex == NULL || recv_mutex == NULL) {
                     ESP_LOGE(tag, "Failed to create mutex - out of memory");
                     last_error_code = NATS_ERR_OUT_OF_MEMORY;
                     if (mutex != NULL) vSemaphoreDelete(mutex);
                     if (io_mutex != NULL) vSemaphoreDelete(io_mutex);
                     if (state_mutex != NULL) vSemaphoreDelete(state_mutex);
-                    mutex = io_mutex = state_mutex = NULL;
+                    if (recv_mutex != NULL) vSemaphoreDelete(recv_mutex);
+                    mutex = io_mutex = state_mutex = recv_mutex = NULL;
                 } else {
                     // Validate TLS configuration if provided
                     if (!validate_tls_config()) {
@@ -251,6 +255,7 @@ class NATS {
             last_reconnect_attempt(0),
             connect_state(DISCONNECTED),
             async_connect_cb(NULL),
+            last_error_code(NATS_ERR_NONE),
             connected(false),
             max_outstanding_pings(3),
             max_reconnect_attempts(-1),
@@ -310,13 +315,15 @@ class NATS {
                 mutex = xSemaphoreCreateRecursiveMutex();
                 io_mutex = xSemaphoreCreateRecursiveMutex();
                 state_mutex = xSemaphoreCreateRecursiveMutex();
-                if (mutex == NULL || io_mutex == NULL || state_mutex == NULL) {
+                recv_mutex = xSemaphoreCreateRecursiveMutex();
+                if (mutex == NULL || io_mutex == NULL || state_mutex == NULL || recv_mutex == NULL) {
                     ESP_LOGE(tag, "Failed to create mutex - out of memory");
                     last_error_code = NATS_ERR_OUT_OF_MEMORY;
                     if (mutex != NULL) vSemaphoreDelete(mutex);
                     if (io_mutex != NULL) vSemaphoreDelete(io_mutex);
                     if (state_mutex != NULL) vSemaphoreDelete(state_mutex);
-                    mutex = io_mutex = state_mutex = NULL;
+                    if (recv_mutex != NULL) vSemaphoreDelete(recv_mutex);
+                    mutex = io_mutex = state_mutex = recv_mutex = NULL;
                 } else {
                     // Validate TLS configuration if provided
                     if (!validate_tls_config()) {
@@ -371,6 +378,10 @@ class NATS {
                 if (state_mutex != NULL) {
                     vSemaphoreDelete(state_mutex);
                     state_mutex = NULL;
+                }
+                if (recv_mutex != NULL) {
+                    vSemaphoreDelete(recv_mutex);
+                    recv_mutex = NULL;
                 }
             }
         }
@@ -1273,6 +1284,8 @@ class NATS {
                 if (sub != NULL && !sub->is_marked_for_deletion()) {
                     // Add reference to prevent deletion during callback
                     sub->add_ref();
+                    // Clear timeout under mutex to prevent races with timeout check
+                    sub->clear_timeout();
                     // Cache whether this will max out BEFORE calling callback
                     will_max_out = (sub->max_wanted > 0 && sub->received + 1 >= sub->max_wanted);
                 } else {
@@ -1281,8 +1294,6 @@ class NATS {
                 xSemaphoreGiveRecursive(mutex);
 
                 if (sub != NULL) {
-                    // Clear timeout to prevent stale timeout callbacks
-                    sub->clear_timeout();
                     // Call user callback WITHOUT holding mutex to prevent deadlock
                     sub->call(e);
 
@@ -1365,6 +1376,8 @@ class NATS {
                 if (sub != NULL && !sub->is_marked_for_deletion()) {
                     // Add reference to prevent deletion during callback
                     sub->add_ref();
+                    // Clear timeout under mutex to prevent races with timeout check
+                    sub->clear_timeout();
                     // Cache whether this will max out BEFORE calling callback
                     will_max_out = (sub->max_wanted > 0 && sub->received + 1 >= sub->max_wanted);
                 } else {
@@ -1373,8 +1386,6 @@ class NATS {
                 xSemaphoreGiveRecursive(mutex);
 
                 if (sub != NULL) {
-                    // Clear timeout to prevent stale timeout callbacks
-                    sub->clear_timeout();
                     // Call user callback WITHOUT holding mutex to prevent deadlock
                     sub->call(e);
 
@@ -1712,6 +1723,10 @@ class NATS {
             xSemaphoreGiveRecursive(mutex);
             if (restored > 0) {
                 ESP_LOGI(tag, "Restored %zu subscriptions after reconnect", restored);
+            }
+            if (restored > NATS_MAX_SUBSCRIPTIONS) {
+                ESP_LOGW(tag, "Restored %zu subscriptions (exceeds limit %d) - server may reject some",
+                         restored, NATS_MAX_SUBSCRIPTIONS);
             }
         }
 
@@ -2063,7 +2078,9 @@ class NATS {
                     while (!connected && (NATSUtil::millis() - start_time) < timeout_ms) {
                         // Check for incoming data
                         if (transport->has_data_available(100)) {  // 100ms timeout
+                            if (recv_mutex != NULL) xSemaphoreTakeRecursive(recv_mutex, portMAX_DELAY);
                             recv();  // Process INFO message, send CONNECT
+                            if (recv_mutex != NULL) xSemaphoreGiveRecursive(recv_mutex);
                         }
                         vTaskDelay(pdMS_TO_TICKS(10));
                     }
@@ -2239,7 +2256,9 @@ class NATS {
                             FD_SET(fd_to_check, &rfds);
                             int ret = select(fd_to_check + 1, &rfds, NULL, NULL, &tv);
                             if (ret > 0 && FD_ISSET(fd_to_check, &rfds)) {
+                                if (recv_mutex != NULL) xSemaphoreTakeRecursive(recv_mutex, portMAX_DELAY);
                                 recv();  // Process INFO message, send CONNECT
+                                if (recv_mutex != NULL) xSemaphoreGiveRecursive(recv_mutex);
                             }
                         }
                         vTaskDelay(pdMS_TO_TICKS(10));  // Small delay to prevent busy loop
@@ -3557,7 +3576,9 @@ class NATS {
                 // Handle transport-based connections (WebSocket)
                 if (transport != NULL) {
                     if (transport->has_data_available(10)) {
+                        if (recv_mutex != NULL) xSemaphoreTakeRecursive(recv_mutex, portMAX_DELAY);
                         recv();
+                        if (recv_mutex != NULL) xSemaphoreGiveRecursive(recv_mutex);
                     }
                     // Yield to prevent watchdog
                     vTaskDelay(pdMS_TO_TICKS(10));
@@ -3577,7 +3598,9 @@ class NATS {
                     FD_SET(fd_to_check, &rfds);
                     int ret = select(fd_to_check + 1, &rfds, NULL, NULL, &tv);
                     if (ret > 0 && FD_ISSET(fd_to_check, &rfds)) {
+                        if (recv_mutex != NULL) xSemaphoreTakeRecursive(recv_mutex, portMAX_DELAY);
                         recv();
+                        if (recv_mutex != NULL) xSemaphoreGiveRecursive(recv_mutex);
                     }
                 }
                 else {
@@ -3651,7 +3674,9 @@ class NATS {
             if (transport != NULL && transport->is_connected()) {
                 // Check for data using transport
                 if (transport->has_data_available(0)) {
+                    if (recv_mutex != NULL) xSemaphoreTakeRecursive(recv_mutex, portMAX_DELAY);
                     recv();
+                    if (recv_mutex != NULL) xSemaphoreGiveRecursive(recv_mutex);
                 }
 
                 // Check for request timeouts
@@ -3668,10 +3693,18 @@ class NATS {
                 xSemaphoreGiveRecursive(mutex);
 
                 for (size_t i = 0; i < timed_out_sids.size(); i++) {
-                    if (timeout_callbacks[i] != NULL) {
-                        timeout_callbacks[i]();
+                    // Re-check under mutex: response may have arrived since we collected timeouts
+                    xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
+                    Sub* sub = (timed_out_sids[i] >= 0 && (size_t)timed_out_sids[i] < subs.size()) ? subs[timed_out_sids[i]] : NULL;
+                    bool still_timed_out = (sub != NULL && !sub->is_marked_for_deletion() && sub->timed_out());
+                    xSemaphoreGiveRecursive(mutex);
+
+                    if (still_timed_out) {
+                        if (timeout_callbacks[i] != NULL) {
+                            timeout_callbacks[i]();
+                        }
+                        unsubscribe(timed_out_sids[i]);
                     }
-                    unsubscribe(timed_out_sids[i]);
                 }
 
                 if (ping_timer.process())
@@ -3697,7 +3730,9 @@ class NATS {
                 FD_SET(fd_to_check, &rfds);
                 int ret = select(fd_to_check + 1, &rfds, NULL, NULL, &tv);
                 if (ret > 0 && FD_ISSET(fd_to_check, &rfds)) {
+                    if (recv_mutex != NULL) xSemaphoreTakeRecursive(recv_mutex, portMAX_DELAY);
                     recv();
+                    if (recv_mutex != NULL) xSemaphoreGiveRecursive(recv_mutex);
                 }
 
                 // Check for request timeouts
@@ -3716,10 +3751,18 @@ class NATS {
 
                 // Now process timeouts without holding the mutex
                 for (size_t i = 0; i < timed_out_sids.size(); i++) {
-                    if (timeout_callbacks[i] != NULL) {
-                        timeout_callbacks[i]();
+                    // Re-check under mutex: response may have arrived since we collected timeouts
+                    xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
+                    Sub* sub = (timed_out_sids[i] >= 0 && (size_t)timed_out_sids[i] < subs.size()) ? subs[timed_out_sids[i]] : NULL;
+                    bool still_timed_out = (sub != NULL && !sub->is_marked_for_deletion() && sub->timed_out());
+                    xSemaphoreGiveRecursive(mutex);
+
+                    if (still_timed_out) {
+                        if (timeout_callbacks[i] != NULL) {
+                            timeout_callbacks[i]();
+                        }
+                        unsubscribe(timed_out_sids[i]);
                     }
-                    unsubscribe(timed_out_sids[i]);
                 }
 
                 if (ping_timer.process())
