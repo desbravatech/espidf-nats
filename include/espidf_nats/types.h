@@ -271,9 +271,9 @@ typedef struct {
     nats_auth_method_t method;     // Authentication method
     const char* token;             // Auth token (NATS_AUTH_TOKEN)
     const char* jwt;               // User JWT (NATS_AUTH_NKEY or NATS_AUTH_CREDENTIALS)
-    const char* nkey_seed;         // NKey seed (NATS_AUTH_NKEY or NATS_AUTH_CREDENTIALS)
-    const char* nkey_public;       // NKey public key (optional, for verification)
-    nats_nkey_sign_fn sign_fn;     // NKey signing function (required for NATS_AUTH_NKEY)
+    const char* nkey_seed;         // NKey seed for signing (NATS_AUTH_NKEY or NATS_AUTH_CREDENTIALS)
+    const char* nkey_public;       // Public NKey sent as "nkey" in CONNECT (NATS_AUTH_NKEY or NATS_AUTH_CREDENTIALS)
+    nats_nkey_sign_fn sign_fn;     // Nonce-signing callback (required for NATS_AUTH_NKEY and NATS_AUTH_CREDENTIALS)
 } nats_auth_config_t;
 
 #endif // ESPIDF_NATS_TYPES_H

@@ -956,6 +956,11 @@ class NATS {
                 NATS_CONF_PEDANTIC ? "true" : "false",
                 NATS_CLIENT_LANG,
                 NATS_CLIENT_VERSION);
+            if (offset < 0 || (size_t)offset >= buf_size) {
+                ESP_LOGE(tag, "CONNECT buffer overflow");
+                free(buf);
+                return;
+            }
 
             // Add authentication fields based on method
             switch (auth_config.method) {
@@ -963,6 +968,11 @@ class NATS {
                     if (user != NULL && pass != NULL) {
                         offset += snprintf(buf + offset, buf_size - offset,
                             ",\"user\":\"%s\",\"pass\":\"%s\"", user, pass);
+                        if (offset < 0 || (size_t)offset >= buf_size) {
+                            ESP_LOGE(tag, "CONNECT buffer overflow");
+                            free(buf);
+                            return;
+                        }
                     }
                     break;
 
@@ -970,15 +980,34 @@ class NATS {
                     if (auth_config.token != NULL) {
                         offset += snprintf(buf + offset, buf_size - offset,
                             ",\"auth_token\":\"%s\"", auth_config.token);
+                        if (offset < 0 || (size_t)offset >= buf_size) {
+                            ESP_LOGE(tag, "CONNECT buffer overflow");
+                            free(buf);
+                            return;
+                        }
                     }
                     break;
 
                 case NATS_AUTH_NKEY:
                 case NATS_AUTH_CREDENTIALS:
+                    // Validate NKey auth requirements
+                    if (auth_config.nkey_seed != NULL && auth_config.sign_fn == NULL) {
+                        ESP_LOGE(tag, "NKey auth requires sign_fn callback");
+                        free(buf);
+                        return;
+                    }
+                    if (auth_config.nkey_seed != NULL && server_nonce[0] == '\0') {
+                        ESP_LOGW(tag, "NKey auth: no server nonce received, signature will be skipped");
+                    }
                     // JWT token
                     if (auth_config.jwt != NULL) {
                         offset += snprintf(buf + offset, buf_size - offset,
                             ",\"jwt\":\"%s\"", auth_config.jwt);
+                        if (offset < 0 || (size_t)offset >= buf_size) {
+                            ESP_LOGE(tag, "CONNECT buffer overflow");
+                            free(buf);
+                            return;
+                        }
                     }
                     // NKey signature (sign server nonce with seed)
                     if (auth_config.nkey_seed != NULL && auth_config.sign_fn != NULL && server_nonce[0] != '\0') {
@@ -988,21 +1017,37 @@ class NATS {
                                 (const uint8_t*)server_nonce, strlen(server_nonce),
                                 signature, &sig_len,
                                 auth_config.nkey_seed)) {
-                            // Base64-encode signature for CONNECT
-                            char sig_b64[128];
-                            NATSUtil::base64_encode(signature, sig_len, sig_b64, sizeof(sig_b64));
-                            offset += snprintf(buf + offset, buf_size - offset,
-                                ",\"sig\":\"%s\"", sig_b64);
-                            // Include nkey public key
-                            if (auth_config.nkey_public != NULL) {
-                                offset += snprintf(buf + offset, buf_size - offset,
-                                    ",\"nkey\":\"%s\"", auth_config.nkey_public);
+                            if (sig_len != 64) {
+                                ESP_LOGE(tag, "NKey signature has unexpected length: %zu (expected 64)", sig_len);
+                            } else {
+                                // Base64-encode signature for CONNECT
+                                char sig_b64[128];
+                                int b64_ret = NATSUtil::base64_encode(signature, sig_len, sig_b64, sizeof(sig_b64));
+                                if (b64_ret < 0) {
+                                    ESP_LOGE(tag, "Failed to base64-encode NKey signature");
+                                } else {
+                                    offset += snprintf(buf + offset, buf_size - offset,
+                                        ",\"sig\":\"%s\"", sig_b64);
+                                    if (offset < 0 || (size_t)offset >= buf_size) {
+                                        ESP_LOGE(tag, "CONNECT buffer overflow");
+                                        free(buf);
+                                        return;
+                                    }
+                                    // Include nkey public key
+                                    if (auth_config.nkey_public != NULL) {
+                                        offset += snprintf(buf + offset, buf_size - offset,
+                                            ",\"nkey\":\"%s\"", auth_config.nkey_public);
+                                        if (offset < 0 || (size_t)offset >= buf_size) {
+                                            ESP_LOGE(tag, "CONNECT buffer overflow");
+                                            free(buf);
+                                            return;
+                                        }
+                                    }
+                                }
                             }
                         } else {
                             ESP_LOGE(tag, "NKey signature failed");
                         }
-                    } else if (auth_config.nkey_seed != NULL && auth_config.sign_fn == NULL) {
-                        ESP_LOGE(tag, "NKey auth requires sign_fn callback");
                     }
                     break;
 
@@ -1012,6 +1057,11 @@ class NATS {
                     if (user != NULL && pass != NULL) {
                         offset += snprintf(buf + offset, buf_size - offset,
                             ",\"user\":\"%s\",\"pass\":\"%s\"", user, pass);
+                        if (offset < 0 || (size_t)offset >= buf_size) {
+                            ESP_LOGE(tag, "CONNECT buffer overflow");
+                            free(buf);
+                            return;
+                        }
                     }
                     break;
             }

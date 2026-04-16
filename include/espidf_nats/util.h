@@ -502,8 +502,9 @@ namespace NATSUtil {
             }
         }
 
-        // Validate: need at least JWT
-        if (*jwt == NULL) {
+        // Both JWT and seed are required for a complete .creds file
+        if (*jwt == NULL || *nkey_seed == NULL) {
+            if (*jwt != NULL) { secure_free(*jwt); *jwt = NULL; }
             if (*nkey_seed != NULL) { secure_free(*nkey_seed); *nkey_seed = NULL; }
             return false;
         }
