@@ -1369,6 +1369,19 @@ class NATS {
                 metrics.msgs_received++;
                 metrics.bytes_received += total_size;
 
+                // Auto-respond to JetStream flow-control heartbeats (Status: 100)
+                // Flow control messages are headers-only with a reply-to that must be echoed back
+                if (data_size == 0 && e.reply != NULL && e.reply[0] != '\0' && header_buf != NULL) {
+                    if (strstr(header_buf, "Status: 100") != NULL) {
+                        ESP_LOGD(tag, "Auto-responding to flow control heartbeat -> %s", e.reply);
+                        publish(e.reply, "");
+                        // Don't deliver flow control messages to user callbacks
+                        free(full_buf);
+                        free(buf);
+                        return;
+                    }
+                }
+
                 // Get callback and cache maxed check using reference counting (Issues #1, #7)
                 xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
                 Sub* sub = subs[sid];
