@@ -9,34 +9,34 @@
 #ifndef ESPIDF_NATS_TCP_TRANSPORT_H
 #define ESPIDF_NATS_TCP_TRANSPORT_H
 
-#include <string.h>
-#include <stdlib.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
-#include <netdb.h>
-#include <unistd.h>
+#include <errno.h>
 #include <esp_log.h>
 #include <esp_tls.h>
+#include <fcntl.h>
 #include <mbedtls/build_info.h>
 #include <mbedtls/ssl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #if MBEDTLS_VERSION_NUMBER < 0x04000000
-#include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
 #endif
-#include <mbedtls/x509_crt.h>
 #include <mbedtls/error.h>
 #include <mbedtls/net_sockets.h>
+#include <mbedtls/x509_crt.h>
 #ifdef CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
 #include <esp_crt_bundle.h>
 #endif
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
-#include "transport.h"
 #include "config.h"
+#include "transport.h"
 
 /**
  * @brief TCP/TLS transport implementation
@@ -44,20 +44,23 @@
  * Implements NatsTransport using BSD sockets with optional TLS via esp-tls
  * or mbedtls (for STARTTLS support).
  */
-class TcpTransport : public NatsTransport {
-private:
-    static constexpr const char* TAG = "tcp_transport";
+class TcpTransport : public NatsTransport
+{
+  private:
+    static constexpr const char *TAG = "tcp_transport";
 
     int sockfd;
-    esp_tls_t* tls;
+    esp_tls_t *tls;
 
     // mbedtls contexts for STARTTLS upgrade
-    mbedtls_ssl_context* mbedtls_ssl;
-    mbedtls_ssl_config* mbedtls_conf;
-    mbedtls_x509_crt* mbedtls_cacert;
+    mbedtls_ssl_context *mbedtls_ssl;
+    mbedtls_ssl_config *mbedtls_conf;
+    mbedtls_x509_crt *mbedtls_cacert;
+    mbedtls_x509_crt *mbedtls_clicert;
+    mbedtls_pk_context *mbedtls_pkey;
 #if MBEDTLS_VERSION_NUMBER < 0x04000000
-    mbedtls_entropy_context* mbedtls_entropy;
-    mbedtls_ctr_drbg_context* mbedtls_ctr_drbg;
+    mbedtls_entropy_context *mbedtls_entropy;
+    mbedtls_ctr_drbg_context *mbedtls_ctr_drbg;
 #endif
     bool using_mbedtls_directly;
 
@@ -68,23 +71,17 @@ private:
     SemaphoreHandle_t io_mutex;
 
     // Current connection hostname (for SNI)
-    char* current_hostname;
+    char *current_hostname;
 
-public:
-    TcpTransport() :
-        sockfd(-1),
-        tls(NULL),
-        mbedtls_ssl(NULL),
-        mbedtls_conf(NULL),
-        mbedtls_cacert(NULL),
+  public:
+    TcpTransport()
+        : sockfd(-1), tls(NULL), mbedtls_ssl(NULL), mbedtls_conf(NULL), mbedtls_cacert(NULL), mbedtls_clicert(NULL),
+          mbedtls_pkey(NULL),
 #if MBEDTLS_VERSION_NUMBER < 0x04000000
-        mbedtls_entropy(NULL),
-        mbedtls_ctr_drbg(NULL),
+          mbedtls_entropy(NULL), mbedtls_ctr_drbg(NULL),
 #endif
-        using_mbedtls_directly(false),
-        state(TRANSPORT_DISCONNECTED),
-        last_error(NATS_ERR_NONE),
-        current_hostname(NULL)
+          using_mbedtls_directly(false), state(TRANSPORT_DISCONNECTED), last_error(NATS_ERR_NONE),
+          current_hostname(NULL)
     {
         memset(&tls_config, 0, sizeof(nats_tls_config_t));
         io_mutex = xSemaphoreCreateRecursiveMutex();
@@ -94,7 +91,8 @@ public:
         }
     }
 
-    virtual ~TcpTransport() {
+    virtual ~TcpTransport()
+    {
         disconnect();
         if (io_mutex != NULL) {
             vSemaphoreDelete(io_mutex);
@@ -110,7 +108,8 @@ public:
     // Connection Lifecycle
     // ========================================================================
 
-    bool connect(const nats_transport_config_t* config) override {
+    bool connect(const nats_transport_config_t *config) override
+    {
         if (config == NULL || config->hostname == NULL) {
             last_error = NATS_ERR_INVALID_ARG;
             return false;
@@ -142,8 +141,10 @@ public:
         return true;
     }
 
-    void disconnect() override {
-        if (io_mutex != NULL) xSemaphoreTakeRecursive(io_mutex, portMAX_DELAY);
+    void disconnect() override
+    {
+        if (io_mutex != NULL)
+            xSemaphoreTakeRecursive(io_mutex, portMAX_DELAY);
 
         // Clean up mbedtls resources (STARTTLS mode)
         cleanup_mbedtls();
@@ -160,16 +161,19 @@ public:
             sockfd = -1;
         }
 
-        if (io_mutex != NULL) xSemaphoreGiveRecursive(io_mutex);
+        if (io_mutex != NULL)
+            xSemaphoreGiveRecursive(io_mutex);
 
         state = TRANSPORT_DISCONNECTED;
     }
 
-    nats_transport_state_t get_state() const override {
+    nats_transport_state_t get_state() const override
+    {
         return state;
     }
 
-    bool is_connected() const override {
+    bool is_connected() const override
+    {
         return state == TRANSPORT_CONNECTED && sockfd >= 0;
     }
 
@@ -177,8 +181,10 @@ public:
     // Data Transmission
     // ========================================================================
 
-    int send_data(const char* data, size_t len) override {
-        if (data == NULL || len == 0) return 0;
+    int send_data(const char *data, size_t len) override
+    {
+        if (data == NULL || len == 0)
+            return 0;
         if (!is_connected()) {
             last_error = NATS_ERR_NOT_CONNECTED;
             return -1;
@@ -187,13 +193,14 @@ public:
         ssize_t ret;
         bool success = true;
 
-        if (io_mutex != NULL) xSemaphoreTakeRecursive(io_mutex, portMAX_DELAY);
+        if (io_mutex != NULL)
+            xSemaphoreTakeRecursive(io_mutex, portMAX_DELAY);
 
         if (using_mbedtls_directly && mbedtls_ssl != NULL) {
             // STARTTLS mode; handle WANT_READ/WANT_WRITE per mbedtls docs
             size_t total_sent = 0;
             while (total_sent < len) {
-                ret = mbedtls_ssl_write(mbedtls_ssl, (const unsigned char*)(data + total_sent), len - total_sent);
+                ret = mbedtls_ssl_write(mbedtls_ssl, (const unsigned char *)(data + total_sent), len - total_sent);
                 if (NATS_TLS_IS_RETRYABLE(ret)) {
                     vTaskDelay(pdMS_TO_TICKS(10));
                     continue;
@@ -206,7 +213,8 @@ public:
                 }
                 total_sent += ret;
             }
-            if (success) ret = total_sent;
+            if (success)
+                ret = total_sent;
         } else if (tls_config.enabled && tls != NULL) {
             // esp-tls mode
             size_t total_sent = 0;
@@ -224,11 +232,13 @@ public:
                 }
                 total_sent += ret;
             }
-            if (success) ret = total_sent;
+            if (success)
+                ret = total_sent;
         } else {
             // Raw TCP
             if (sockfd < 0) {
-                if (io_mutex != NULL) xSemaphoreGiveRecursive(io_mutex);
+                if (io_mutex != NULL)
+                    xSemaphoreGiveRecursive(io_mutex);
                 last_error = NATS_ERR_NOT_CONNECTED;
                 return -1;
             }
@@ -243,10 +253,12 @@ public:
                 }
                 total_sent += ret;
             }
-            if (success) ret = total_sent;
+            if (success)
+                ret = total_sent;
         }
 
-        if (io_mutex != NULL) xSemaphoreGiveRecursive(io_mutex);
+        if (io_mutex != NULL)
+            xSemaphoreGiveRecursive(io_mutex);
 
         if (!success) {
             disconnect();
@@ -256,20 +268,24 @@ public:
         return (int)ret;
     }
 
-    int send_line(const char* line) override {
-        if (line == NULL) return 0;
+    int send_line(const char *line) override
+    {
+        if (line == NULL)
+            return 0;
 
         size_t len = strlen(line);
         int bytes_sent = 0;
 
         // Send the line
         int ret = send_data(line, len);
-        if (ret < 0) return ret;
+        if (ret < 0)
+            return ret;
         bytes_sent += ret;
 
         // Send CRLF
         ret = send_data(NATS_CR_LF, 2);
-        if (ret < 0) return ret;
+        if (ret < 0)
+            return ret;
         bytes_sent += ret;
 
         return bytes_sent;
@@ -279,29 +295,31 @@ public:
     // Data Reception
     // ========================================================================
 
-    char* read_line(size_t initial_cap) override {
+    char *read_line(size_t initial_cap) override
+    {
         if (!is_connected()) {
             last_error = NATS_ERR_NOT_CONNECTED;
-            return (char*)calloc(1, sizeof(char));
+            return (char *)calloc(1, sizeof(char));
         }
 
         size_t cap = initial_cap;
-        char* buf = (char*)malloc(cap * sizeof(char));
+        char *buf = (char *)malloc(cap * sizeof(char));
         if (buf == NULL) {
             ESP_LOGE(TAG, "Failed to allocate readline buffer");
             last_error = NATS_ERR_OUT_OF_MEMORY;
-            return (char*)calloc(1, sizeof(char));
+            return (char *)calloc(1, sizeof(char));
         }
 
         int i = 0;
         char c;
         int ret;
 
-        if (io_mutex != NULL) xSemaphoreTakeRecursive(io_mutex, portMAX_DELAY);
+        if (io_mutex != NULL)
+            xSemaphoreTakeRecursive(io_mutex, portMAX_DELAY);
 
         while (true) {
             if (using_mbedtls_directly && mbedtls_ssl != NULL) {
-                ret = mbedtls_ssl_read(mbedtls_ssl, (unsigned char*)&c, 1);
+                ret = mbedtls_ssl_read(mbedtls_ssl, (unsigned char *)&c, 1);
             } else if (tls_config.enabled && tls != NULL) {
                 ret = esp_tls_conn_read(tls, &c, 1);
             } else {
@@ -320,52 +338,60 @@ public:
                     ESP_LOGE(TAG, "Read error: %d", ret);
                     last_error = NATS_ERR_SOCKET_FAILED;
                 }
-                if (io_mutex != NULL) xSemaphoreGiveRecursive(io_mutex);
+                if (io_mutex != NULL)
+                    xSemaphoreGiveRecursive(io_mutex);
                 free(buf);
                 disconnect();
-                return (char*)calloc(1, sizeof(char));
+                return (char *)calloc(1, sizeof(char));
             }
 
-            if (c == '\r') continue;
-            if (c == '\n') break;
+            if (c == '\r')
+                continue;
+            if (c == '\n')
+                break;
 
             if ((size_t)i >= cap - 1) {
                 if (cap >= NATS_MAX_LINE_SIZE) {
                     ESP_LOGE(TAG, "Line too long (exceeds %d bytes)", NATS_MAX_LINE_SIZE);
-                    if (io_mutex != NULL) xSemaphoreGiveRecursive(io_mutex);
+                    if (io_mutex != NULL)
+                        xSemaphoreGiveRecursive(io_mutex);
                     free(buf);
                     disconnect();
-                    return (char*)calloc(1, sizeof(char));
+                    return (char *)calloc(1, sizeof(char));
                 }
                 if (cap > SIZE_MAX / 2) {
                     ESP_LOGE(TAG, "Readline buffer too large");
-                    if (io_mutex != NULL) xSemaphoreGiveRecursive(io_mutex);
+                    if (io_mutex != NULL)
+                        xSemaphoreGiveRecursive(io_mutex);
                     free(buf);
                     disconnect();
-                    return (char*)calloc(1, sizeof(char));
+                    return (char *)calloc(1, sizeof(char));
                 }
                 cap *= 2;
-                char* newbuf = (char*)realloc(buf, cap + 1);
+                char *newbuf = (char *)realloc(buf, cap + 1);
                 if (newbuf == NULL) {
                     ESP_LOGE(TAG, "Failed to realloc readline buffer");
-                    if (io_mutex != NULL) xSemaphoreGiveRecursive(io_mutex);
+                    if (io_mutex != NULL)
+                        xSemaphoreGiveRecursive(io_mutex);
                     free(buf);
                     disconnect();
-                    return (char*)calloc(1, sizeof(char));
+                    return (char *)calloc(1, sizeof(char));
                 }
                 buf = newbuf;
             }
             buf[i++] = c;
         }
 
-        if (io_mutex != NULL) xSemaphoreGiveRecursive(io_mutex);
+        if (io_mutex != NULL)
+            xSemaphoreGiveRecursive(io_mutex);
         buf[i] = '\0';
         return buf;
     }
 
-    char* read_bytes(size_t n) override {
+    char *read_bytes(size_t n) override
+    {
         if (n == 0) {
-            return (char*)calloc(1, sizeof(char));
+            return (char *)calloc(1, sizeof(char));
         }
 
         if (!is_connected()) {
@@ -373,7 +399,7 @@ public:
             return NULL;
         }
 
-        char* buf = (char*)malloc(n + 1);
+        char *buf = (char *)malloc(n + 1);
         if (buf == NULL) {
             ESP_LOGE(TAG, "Failed to allocate read buffer for %zu bytes", n);
             last_error = NATS_ERR_OUT_OF_MEMORY;
@@ -382,14 +408,15 @@ public:
 
         size_t total_read = 0;
 
-        if (io_mutex != NULL) xSemaphoreTakeRecursive(io_mutex, portMAX_DELAY);
+        if (io_mutex != NULL)
+            xSemaphoreTakeRecursive(io_mutex, portMAX_DELAY);
 
         while (total_read < n) {
             int ret;
             size_t to_read = n - total_read;
 
             if (using_mbedtls_directly && mbedtls_ssl != NULL) {
-                ret = mbedtls_ssl_read(mbedtls_ssl, (unsigned char*)(buf + total_read), to_read);
+                ret = mbedtls_ssl_read(mbedtls_ssl, (unsigned char *)(buf + total_read), to_read);
             } else if (tls_config.enabled && tls != NULL) {
                 ret = esp_tls_conn_read(tls, buf + total_read, to_read);
             } else {
@@ -406,7 +433,8 @@ public:
                     ESP_LOGE(TAG, "Read error: %d", ret);
                     last_error = NATS_ERR_SOCKET_FAILED;
                 }
-                if (io_mutex != NULL) xSemaphoreGiveRecursive(io_mutex);
+                if (io_mutex != NULL)
+                    xSemaphoreGiveRecursive(io_mutex);
                 free(buf);
                 disconnect();
                 return NULL;
@@ -414,25 +442,29 @@ public:
             total_read += ret;
         }
 
-        if (io_mutex != NULL) xSemaphoreGiveRecursive(io_mutex);
+        if (io_mutex != NULL)
+            xSemaphoreGiveRecursive(io_mutex);
         buf[n] = '\0';
         return buf;
     }
 
-    void skip_bytes(size_t n) override {
-        if (n == 0 || !is_connected()) return;
+    void skip_bytes(size_t n) override
+    {
+        if (n == 0 || !is_connected())
+            return;
 
         char discard[16];
         size_t remaining = n;
 
-        if (io_mutex != NULL) xSemaphoreTakeRecursive(io_mutex, portMAX_DELAY);
+        if (io_mutex != NULL)
+            xSemaphoreTakeRecursive(io_mutex, portMAX_DELAY);
 
         while (remaining > 0) {
             size_t to_read = (remaining < sizeof(discard)) ? remaining : sizeof(discard);
             int ret;
 
             if (using_mbedtls_directly && mbedtls_ssl != NULL) {
-                ret = mbedtls_ssl_read(mbedtls_ssl, (unsigned char*)discard, to_read);
+                ret = mbedtls_ssl_read(mbedtls_ssl, (unsigned char *)discard, to_read);
             } else if (tls_config.enabled && tls != NULL) {
                 ret = esp_tls_conn_read(tls, discard, to_read);
             } else {
@@ -448,25 +480,30 @@ public:
                 if (ret < 0) {
                     ESP_LOGE(TAG, "Skip bytes error: %d", ret);
                 }
-                if (io_mutex != NULL) xSemaphoreGiveRecursive(io_mutex);
+                if (io_mutex != NULL)
+                    xSemaphoreGiveRecursive(io_mutex);
                 disconnect();
                 return;
             }
             remaining -= ret;
         }
 
-        if (io_mutex != NULL) xSemaphoreGiveRecursive(io_mutex);
+        if (io_mutex != NULL)
+            xSemaphoreGiveRecursive(io_mutex);
     }
 
     // ========================================================================
     // Polling
     // ========================================================================
 
-    bool has_data_available(int timeout_ms) override {
-        if (!is_connected()) return false;
+    bool has_data_available(int timeout_ms) override
+    {
+        if (!is_connected())
+            return false;
 
         int fd = get_fd();
-        if (fd < 0) return false;
+        if (fd < 0)
+            return false;
 
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -480,7 +517,8 @@ public:
         return (ret > 0 && FD_ISSET(fd, &rfds));
     }
 
-    int get_fd() const override {
+    int get_fd() const override
+    {
         if (tls_config.enabled && tls != NULL) {
             int fd = -1;
             if (esp_tls_get_conn_sockfd(tls, &fd) == ESP_OK) {
@@ -495,22 +533,34 @@ public:
     // Error Handling
     // ========================================================================
 
-    nats_error_code_t get_last_error() const override {
+    nats_error_code_t get_last_error() const override
+    {
         return last_error;
     }
 
-    const char* get_error_string() const override {
+    const char *get_error_string() const override
+    {
         switch (last_error) {
-            case NATS_ERR_NONE: return "No error";
-            case NATS_ERR_CONNECTION_FAILED: return "Connection failed";
-            case NATS_ERR_DNS_RESOLUTION_FAILED: return "DNS resolution failed";
-            case NATS_ERR_TLS_INIT_FAILED: return "TLS initialization failed";
-            case NATS_ERR_TLS_CONNECTION_FAILED: return "TLS connection failed";
-            case NATS_ERR_SOCKET_FAILED: return "Socket operation failed";
-            case NATS_ERR_NOT_CONNECTED: return "Not connected";
-            case NATS_ERR_OUT_OF_MEMORY: return "Out of memory";
-            case NATS_ERR_INVALID_ARG: return "Invalid argument";
-            default: return "Unknown error";
+            case NATS_ERR_NONE:
+                return "No error";
+            case NATS_ERR_CONNECTION_FAILED:
+                return "Connection failed";
+            case NATS_ERR_DNS_RESOLUTION_FAILED:
+                return "DNS resolution failed";
+            case NATS_ERR_TLS_INIT_FAILED:
+                return "TLS initialization failed";
+            case NATS_ERR_TLS_CONNECTION_FAILED:
+                return "TLS connection failed";
+            case NATS_ERR_SOCKET_FAILED:
+                return "Socket operation failed";
+            case NATS_ERR_NOT_CONNECTED:
+                return "Not connected";
+            case NATS_ERR_OUT_OF_MEMORY:
+                return "Out of memory";
+            case NATS_ERR_INVALID_ARG:
+                return "Invalid argument";
+            default:
+                return "Unknown error";
         }
     }
 
@@ -518,7 +568,8 @@ public:
     // TCP-Specific: STARTTLS Support
     // ========================================================================
 
-    bool upgrade_to_tls(const nats_tls_config_t* tls_cfg) override {
+    bool upgrade_to_tls(const nats_tls_config_t *tls_cfg) override
+    {
         if (tls_cfg == NULL || sockfd < 0) {
             last_error = NATS_ERR_INVALID_ARG;
             return false;
@@ -528,7 +579,7 @@ public:
         tls_config = *tls_cfg;
 
         if (!tls_config.enabled) {
-            return true;  // TLS not enabled, nothing to do
+            return true; // TLS not enabled, nothing to do
         }
 
         ESP_LOGI(TAG, "Upgrading connection to TLS on socket %d (using mbedtls)...", sockfd);
@@ -537,18 +588,21 @@ public:
         char err_buf[100];
 
         // Allocate mbedtls contexts
-        mbedtls_ssl = (mbedtls_ssl_context*)malloc(sizeof(mbedtls_ssl_context));
-        mbedtls_conf = (mbedtls_ssl_config*)malloc(sizeof(mbedtls_ssl_config));
-        mbedtls_cacert = (mbedtls_x509_crt*)malloc(sizeof(mbedtls_x509_crt));
+        mbedtls_ssl = (mbedtls_ssl_context *)malloc(sizeof(mbedtls_ssl_context));
+        mbedtls_conf = (mbedtls_ssl_config *)malloc(sizeof(mbedtls_ssl_config));
+        mbedtls_cacert = (mbedtls_x509_crt *)malloc(sizeof(mbedtls_x509_crt));
+        mbedtls_clicert = (mbedtls_x509_crt *)malloc(sizeof(mbedtls_x509_crt));
+        mbedtls_pkey = (mbedtls_pk_context *)malloc(sizeof(mbedtls_pk_context));
 #if MBEDTLS_VERSION_NUMBER < 0x04000000
-        mbedtls_entropy = (mbedtls_entropy_context*)malloc(sizeof(mbedtls_entropy_context));
-        mbedtls_ctr_drbg = (mbedtls_ctr_drbg_context*)malloc(sizeof(mbedtls_ctr_drbg_context));
+        mbedtls_entropy = (mbedtls_entropy_context *)malloc(sizeof(mbedtls_entropy_context));
+        mbedtls_ctr_drbg = (mbedtls_ctr_drbg_context *)malloc(sizeof(mbedtls_ctr_drbg_context));
 #endif
 
 #if MBEDTLS_VERSION_NUMBER < 0x04000000
-        if (!mbedtls_ssl || !mbedtls_conf || !mbedtls_cacert || !mbedtls_entropy || !mbedtls_ctr_drbg) {
+        if (!mbedtls_ssl || !mbedtls_conf || !mbedtls_cacert || !mbedtls_clicert || !mbedtls_pkey || !mbedtls_entropy ||
+            !mbedtls_ctr_drbg) {
 #else
-        if (!mbedtls_ssl || !mbedtls_conf || !mbedtls_cacert) {
+        if (!mbedtls_ssl || !mbedtls_conf || !mbedtls_cacert || !mbedtls_clicert || !mbedtls_pkey) {
 #endif
             ESP_LOGE(TAG, "Failed to allocate mbedtls contexts");
             cleanup_mbedtls();
@@ -560,13 +614,15 @@ public:
         mbedtls_ssl_init(mbedtls_ssl);
         mbedtls_ssl_config_init(mbedtls_conf);
         mbedtls_x509_crt_init(mbedtls_cacert);
+        mbedtls_x509_crt_init(mbedtls_clicert);
+        mbedtls_pk_init(mbedtls_pkey);
 #if MBEDTLS_VERSION_NUMBER < 0x04000000
         mbedtls_entropy_init(mbedtls_entropy);
         mbedtls_ctr_drbg_init(mbedtls_ctr_drbg);
 
         // Seed the random number generator (mbedtls 3.x only; 4.x uses PSA Crypto RNG)
         ret = mbedtls_ctr_drbg_seed(mbedtls_ctr_drbg, mbedtls_entropy_func, mbedtls_entropy,
-                                    (const unsigned char*)"nats_tls", 8);
+                                    (const unsigned char *)"nats_tls", 8);
         if (ret != 0) {
             mbedtls_strerror(ret, err_buf, sizeof(err_buf));
             ESP_LOGE(TAG, "mbedtls_ctr_drbg_seed failed: %s (0x%x)", err_buf, -ret);
@@ -587,8 +643,7 @@ public:
         }
 #endif
         if (!ca_configured && tls_config.ca_cert != NULL && tls_config.ca_cert_len > 0) {
-            ret = mbedtls_x509_crt_parse(mbedtls_cacert,
-                                         (const unsigned char*)tls_config.ca_cert,
+            ret = mbedtls_x509_crt_parse(mbedtls_cacert, (const unsigned char *)tls_config.ca_cert,
                                          tls_config.ca_cert_len);
             if (ret != 0) {
                 mbedtls_strerror(ret, err_buf, sizeof(err_buf));
@@ -600,10 +655,39 @@ public:
             ca_configured = true;
         }
 
+        bool client_configured = false;
+        if (tls_config.client_cert != NULL && tls_config.client_cert_len > 0 && tls_config.client_key != NULL &&
+            tls_config.client_key_len > 0) {
+            ret = mbedtls_x509_crt_parse(mbedtls_clicert, (const unsigned char *)tls_config.client_cert,
+                                         tls_config.client_cert_len);
+            if (ret != 0) {
+                mbedtls_strerror(ret, err_buf, sizeof(err_buf));
+                ESP_LOGE(TAG, "mbedtls_x509_crt_parse for client cert failed: %s (0x%x)", err_buf, -ret);
+                cleanup_mbedtls();
+                last_error = NATS_ERR_TLS_INIT_FAILED;
+                return false;
+            }
+
+            int (*f_rng)(void *, unsigned char *, size_t) = NULL;
+            void *p_rng = NULL;
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
+            f_rng = mbedtls_ctr_drbg_random;
+            p_rng = mbedtls_ctr_drbg;
+#endif
+            ret = mbedtls_pk_parse_key(mbedtls_pkey, (const unsigned char *)tls_config.client_key,
+                                       tls_config.client_key_len, NULL, 0, f_rng, p_rng);
+            if (ret != 0) {
+                mbedtls_strerror(ret, err_buf, sizeof(err_buf));
+                ESP_LOGE(TAG, "mbedtls_pk_parse_key failed: %s (0x%x)", err_buf, -ret);
+                cleanup_mbedtls();
+                last_error = NATS_ERR_TLS_INIT_FAILED;
+                return false;
+            }
+            client_configured = true;
+        }
+
         // Set up SSL config
-        ret = mbedtls_ssl_config_defaults(mbedtls_conf,
-                                          MBEDTLS_SSL_IS_CLIENT,
-                                          MBEDTLS_SSL_TRANSPORT_STREAM,
+        ret = mbedtls_ssl_config_defaults(mbedtls_conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM,
                                           MBEDTLS_SSL_PRESET_DEFAULT);
         if (ret != 0) {
             mbedtls_strerror(ret, err_buf, sizeof(err_buf));
@@ -628,6 +712,17 @@ public:
             mbedtls_ssl_conf_authmode(mbedtls_conf, MBEDTLS_SSL_VERIFY_NONE);
         }
 
+        if (client_configured) {
+            ret = mbedtls_ssl_conf_own_cert(mbedtls_conf, mbedtls_clicert, mbedtls_pkey);
+            if (ret != 0) {
+                mbedtls_strerror(ret, err_buf, sizeof(err_buf));
+                ESP_LOGE(TAG, "mbedtls_ssl_conf_own_cert failed: %s (0x%x)", err_buf, -ret);
+                cleanup_mbedtls();
+                last_error = NATS_ERR_TLS_INIT_FAILED;
+                return false;
+            }
+        }
+
 #if MBEDTLS_VERSION_NUMBER < 0x04000000
         // mbedtls 3.x requires explicit RNG wiring; 4.x uses PSA Crypto internally
         mbedtls_ssl_conf_rng(mbedtls_conf, mbedtls_ctr_drbg_random, mbedtls_ctr_drbg);
@@ -644,7 +739,7 @@ public:
         }
 
         // Set hostname for SNI and certificate verification
-        const char* hostname = tls_config.server_name;
+        const char *hostname = tls_config.server_name;
         if (hostname == NULL) {
             hostname = current_hostname;
         }
@@ -688,10 +783,11 @@ public:
         return true;
     }
 
-private:
+  private:
     // Static callback functions for mbedtls bio
-    static int mbedtls_net_send_cb(void* ctx, const unsigned char* buf, size_t len) {
-        int fd = *((int*)ctx);
+    static int mbedtls_net_send_cb(void *ctx, const unsigned char *buf, size_t len)
+    {
+        int fd = *((int *)ctx);
         int ret = ::send(fd, buf, len, 0);
         if (ret < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -702,8 +798,9 @@ private:
         return ret;
     }
 
-    static int mbedtls_net_recv_cb(void* ctx, unsigned char* buf, size_t len) {
-        int fd = *((int*)ctx);
+    static int mbedtls_net_recv_cb(void *ctx, unsigned char *buf, size_t len)
+    {
+        int fd = *((int *)ctx);
         int ret = ::recv(fd, buf, len, 0);
         if (ret < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -714,7 +811,8 @@ private:
         return ret;
     }
 
-    void cleanup_mbedtls() {
+    void cleanup_mbedtls()
+    {
         if (mbedtls_ssl) {
             mbedtls_ssl_free(mbedtls_ssl);
             free(mbedtls_ssl);
@@ -729,6 +827,16 @@ private:
             mbedtls_x509_crt_free(mbedtls_cacert);
             free(mbedtls_cacert);
             mbedtls_cacert = NULL;
+        }
+        if (mbedtls_clicert) {
+            mbedtls_x509_crt_free(mbedtls_clicert);
+            free(mbedtls_clicert);
+            mbedtls_clicert = NULL;
+        }
+        if (mbedtls_pkey) {
+            mbedtls_pk_free(mbedtls_pkey);
+            free(mbedtls_pkey);
+            mbedtls_pkey = NULL;
         }
 #if MBEDTLS_VERSION_NUMBER < 0x04000000
         if (mbedtls_ctr_drbg) {
@@ -745,13 +853,14 @@ private:
         using_mbedtls_directly = false;
     }
 
-    bool try_connect_to_host(const char* hostname, int port) {
+    bool try_connect_to_host(const char *hostname, int port)
+    {
         struct addrinfo hints = {};
         struct addrinfo *result, *rp;
         char port_str[6];
         snprintf(port_str, sizeof(port_str), "%d", port);
 
-        hints.ai_family = AF_UNSPEC;     // Allow IPv4 or IPv6
+        hints.ai_family = AF_UNSPEC; // Allow IPv4 or IPv6
         hints.ai_socktype = SOCK_STREAM;
         hints.ai_protocol = IPPROTO_TCP;
 
@@ -765,7 +874,8 @@ private:
         // Try each address until we successfully connect
         for (rp = result; rp != NULL; rp = rp->ai_next) {
             sockfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-            if (sockfd < 0) continue;
+            if (sockfd < 0)
+                continue;
 
             // Set socket to non-blocking mode for timeout support
             int flags = fcntl(sockfd, F_GETFL, 0);
